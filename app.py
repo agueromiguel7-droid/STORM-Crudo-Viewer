@@ -1300,8 +1300,8 @@ with t_det6b:
                 paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
                 margin=dict(t=40, b=20, l=20, r=20), height=180
             )
-            fig_rent_t8.add_annotation(x=v_gt_bar/2,            y=0, text=f"State<br>{v_gt_bar:.1f}%",      showarrow=False, font=dict(color="white", size=13, weight=800))
-            fig_rent_t8.add_annotation(x=v_gt_bar+v_ct_bar/2,   y=0, text=f"Contractor<br>{v_ct_bar:.1f}%", showarrow=False, font=dict(color="white", size=13, weight=800))
+            fig_rent_t8.add_annotation(x=v_gt_bar/2,            y=0, text=f"State<br>{v_gt_bar:.1f}%",      showarrow=False, font=dict(color="white", size=13, weight="bold"))
+            fig_rent_t8.add_annotation(x=v_gt_bar+v_ct_bar/2,   y=0, text=f"Contractor<br>{v_ct_bar:.1f}%", showarrow=False, font=dict(color="white", size=13, weight="bold"))
             st.plotly_chart(fig_rent_t8, use_container_width=True)
 
         with c_heat_t8:
