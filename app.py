@@ -121,6 +121,10 @@ def ind_mean(sc, key):
 
 def find_logo(pattern):
     for ext in ["png", "jpg", "jpeg", "PNG", "JPG"]:
+        exact = f"assets/{pattern}.{ext}"
+        if os.path.exists(exact):
+            return exact
+    for ext in ["png", "jpg", "jpeg", "PNG", "JPG"]:
         matches = glob.glob(f"assets/{pattern}*.{ext}")
         if matches:
             return matches[0]
@@ -129,7 +133,7 @@ def find_logo(pattern):
 # ─── SIDEBAR LAYOUT ────────────────────────────────────────────────────────────
 c1, c2 = st.sidebar.columns(2)
 with c1:
-    logo1 = find_logo("mi") or find_logo("company") or find_logo("logo_empresa")
+    logo1 = find_logo("mi_logo") or find_logo("mi") or find_logo("company") or find_logo("logo_empresa")
     if logo1:
         st.image(logo1)
     else:
