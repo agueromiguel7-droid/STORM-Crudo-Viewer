@@ -81,7 +81,7 @@ if not st.session_state['authenticated']:
             st.markdown("#### Login")
             user = st.text_input("Username")
             pwd = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Access Application", width="stretch")
+            submitted = st.form_submit_button("Access Application", use_container_width=True)
             
             if submitted:
                 users = load_users()
@@ -193,7 +193,7 @@ if '_sel_scenario' not in st.session_state:
     st.session_state['_sel_scenario'] = scenario_names[0]
 
 # Analysis Premises button
-if st.sidebar.button(NAV_PREMISES, width="stretch",
+if st.sidebar.button(NAV_PREMISES, use_container_width=True,
                      type="primary" if st.session_state['nav_page'] == NAV_PREMISES else "secondary"):
     st.session_state['nav_page'] = NAV_PREMISES
     st.rerun()
@@ -258,14 +258,14 @@ if st.session_state['username'] == 'admin':
                     save_users(users)
                     st.success(f"User '{new_u}' created!")
 
-if st.sidebar.button("🔒 Logout", width="stretch"):
+if st.sidebar.button("🔒 Logout", use_container_width=True):
     st.session_state['authenticated'] = False
     st.session_state['username'] = None
     st.rerun()
 
 # ── Refresh / Clear Cache at bottom ──
 st.sidebar.markdown("<hr style='border:none; border-top:1px solid #e2e8f0; margin:10px 0;'>", unsafe_allow_html=True)
-if st.sidebar.button("🔄 Refresh / Clear Cache", width="stretch"):
+if st.sidebar.button("🔄 Refresh / Clear Cache", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
