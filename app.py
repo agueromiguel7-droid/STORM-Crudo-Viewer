@@ -194,12 +194,13 @@ NAV_PREMISES = "📋 Analysis Premises"
 if 'nav_page' not in st.session_state:
     st.session_state['nav_page'] = NAV_PREMISES
 if '_sel_scenario' not in st.session_state:
-    st.session_state['_sel_scenario'] = scenario_names[0]
+    st.session_state['_sel_scenario'] = None
 
 # Analysis Premises button
 if st.sidebar.button(NAV_PREMISES, use_container_width=True,
                      type="primary" if st.session_state['nav_page'] == NAV_PREMISES else "secondary"):
     st.session_state['nav_page'] = NAV_PREMISES
+    st.session_state['_sel_scenario'] = None
     st.rerun()
 
 st.sidebar.markdown("<hr style='border:none; border-top:1px solid #e2e8f0; margin:10px 0;'>", unsafe_allow_html=True)
@@ -207,36 +208,42 @@ st.sidebar.markdown("<h3 style='color: #718096; font-size: 0.85rem; font-weight:
 
 # on_change callback: called ONLY when user clicks a different scenario
 def _on_scenario_change():
-    st.session_state['nav_page'] = st.session_state['_sel_scenario']
+    if st.session_state.get('_sel_scenario'):
+        st.session_state['nav_page'] = st.session_state['_sel_scenario']
 
-# Scenario radio — backed by session state key, on_change fires only on real user interaction
-# Note: do NOT pass index= when using key=, as session_state is the single source of truth
+# Scenario radio — backed by session state key, index=None when on Analysis Premises
 sel_esc_name = st.sidebar.radio(
     "Select Scenario", scenario_names,
+    index=None,
     key='_sel_scenario',
     on_change=_on_scenario_change,
     label_visibility="collapsed"
 )
 
-sel_sc = next(s for s in scenarios if s['params'].get('esc_name', s['_filename']) == sel_esc_name)
-sel_color = sel_sc['_color']
+# Reference scenario for styling/colors
+if sel_esc_name:
+    sel_sc = next((s for s in scenarios if s['params'].get('esc_name', s['_filename']) == sel_esc_name), scenarios[0])
+else:
+    sel_sc = scenarios[0]
 
-# Scenario Image
-search_names = [
-    sel_esc_name, 
-    sel_esc_name.replace("Sc.", "Scenario").strip(),
-    sel_esc_name.replace("Sce.", "Scenario").strip()
-]
-if sel_esc_name == "Case Base":
-    search_names.append("Base Case")
+sel_color = sel_sc.get('_color', '#00d4ff')
 
-scen_img = None
-for name in search_names:
-    scen_img = find_logo(name)
-    if scen_img:
-        break
+if st.session_state['nav_page'] != NAV_PREMISES and sel_esc_name:
+    # Scenario Image
+    search_names = [
+        sel_esc_name, 
+        sel_esc_name.replace("Sc.", "Scenario").strip(),
+        sel_esc_name.replace("Sce.", "Scenario").strip()
+    ]
+    if sel_esc_name == "Case Base":
+        search_names.append("Base Case")
 
-if st.session_state['nav_page'] != NAV_PREMISES:
+    scen_img = None
+    for name in search_names:
+        scen_img = find_logo(name)
+        if scen_img:
+            break
+
     if scen_img:
         st.sidebar.image(scen_img)
     else:
@@ -465,7 +472,12 @@ if st.session_state.get('nav_page') == NAV_PREMISES:
 
     st.stop()
 
-# When a scenario is selected via radio, sync nav_page
+# Ensure scenario variables are defined past premises page
+if not sel_esc_name:
+    sel_esc_name = scenario_names[0]
+    sel_sc = next((s for s in scenarios if s['params'].get('esc_name', s['_filename']) == sel_esc_name), scenarios[0])
+    sel_color = sel_sc['_color']
+
 if st.session_state.get('nav_page') != sel_esc_name and st.session_state.get('nav_page') != NAV_PREMISES:
     st.session_state['nav_page'] = sel_esc_name
 
