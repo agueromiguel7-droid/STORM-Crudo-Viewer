@@ -8,6 +8,11 @@ import glob
 import os
 import textwrap
 
+try:
+    import numpy_financial as npf
+except ImportError:
+    npf = None
+
 st.set_page_config(
     page_title="STORM-Viewer",
     page_icon="⚡",
@@ -119,6 +124,193 @@ def ind_mean(sc, key):
     arr = sc['indicators'].get(key, [0.0])
     return float(np.mean(arr))
 
+def _safe_mirr_annual(cf_monthly, finance_rate, reinvest_rate):
+    """
+    Calcula la TIRM mensual y la convierte a TIRM Anual Efectiva.
+    Equivalente a la función TIRM() de Excel / npf.mirr().
+    """
+    try:
+        cf = np.asarray(cf_monthly, dtype=float)
+        has_neg = np.any(cf < 0)
+        has_pos = np.any(cf > 0)
+        if not (has_neg and has_pos):
+            return None
+        if npf is not None:
+            r_monthly = npf.mirr(cf, finance_rate, reinvest_rate)
+        else:
+            n = len(cf) - 1
+            pos = cf > 0
+            neg = cf < 0
+            pv_neg = np.sum(cf[neg] / ((1 + finance_rate) ** np.arange(len(cf))[neg]))
+            fv_pos = np.sum(cf[pos] * ((1 + reinvest_rate) ** (n - np.arange(len(cf))[pos])))
+            if pv_neg >= 0 or fv_pos <= 0:
+                return None
+            r_monthly = (-fv_pos / pv_neg) ** (1 / n) - 1
+        if r_monthly is None or not np.isfinite(r_monthly) or r_monthly <= -1.0:
+            return None
+        return float(((1 + r_monthly) ** 12 - 1) * 100.0)
+    except Exception:
+        return None
+
+def _simulate_investor_cf(cf_post_tax_mm, capital_inicial):
+    """
+    Simula el flujo de caja del inversionista y el balance del fondo del proyecto.
+    El contratista aporta un capital_inicial en el mes 0 (outflow -capital_inicial).
+    Mes a mes, los egresos y tributos se cubren del balance del fondo.
+    Si el balance cae por debajo de 0, el inversionista inyecta el déficit.
+    Si el balance supera el capital_inicial, se distribuye el excedente.
+    Al finalizar el proyecto, el balance remanente se liquida al inversionista.
+    """
+    is_1d = False
+    arr = np.asarray(cf_post_tax_mm, dtype=float)
+    if arr.ndim == 1:
+        is_1d = True
+        arr = arr[np.newaxis, :]
+    n_iters, n_periods = arr.shape
+    B = np.full(n_iters, capital_inicial, dtype=float)
+    cf_investor = np.zeros((n_iters, n_periods + 1))
+    cf_investor[:, 0] = -capital_inicial
+    cash_pool = np.zeros((n_iters, n_periods))
+    
+    for t in range(n_periods):
+        cf_t = arr[:, t]
+        b_potential = B + cf_t
+        injections = np.where(b_potential < 0, -b_potential, 0.0)
+        distributions = np.where(b_potential > capital_inicial, b_potential - capital_inicial, 0.0)
+        cf_investor[:, t + 1] = distributions - injections
+        B = b_potential + injections - distributions
+        cash_pool[:, t] = B
+        
+    cf_investor[:, -1] += B
+    if is_1d:
+        return cf_investor[0], cash_pool[0]
+    return cf_investor, cash_pool
+
+def _get_autofin_cases(sc):
+    """
+    Extrae o computa los 3 casos de capital inicial para el análisis de caja autofinanciable.
+    """
+    if 'autofin_cases' in sc and sc['autofin_cases']:
+        return sc['autofin_cases'], sc['params'].get('capital_inicial_casos', [])
+        
+    p = sc['params']
+    cf = sc.get('cash_flows', {})
+    dates = sc.get('dates', [])
+    n_periods = len(dates)
+    if n_periods == 0 or 'cf_post_tax' not in cf:
+        return {}, []
+        
+    cap_cases = p.get('capital_inicial_casos', [])
+    if not cap_cases:
+        cap_base = float(p.get('capital_inicial', 40.0))
+        cap_cases = [max(0.0, cap_base - 10.0), cap_base, cap_base + 10.0]
+    cap_cases = [float(x) for x in cap_cases]
+    
+    cf_post = np.array(cf['cf_post_tax'], dtype=float)
+    discount_rate = float(p.get('discount_rate', 15.0)) / 100.0
+    monthly_r = (1 + discount_rate) ** (1 / 12) - 1
+    finance_rate_m = monthly_r
+    reinvest_rate_m = monthly_r
+    
+    cases_dict = {}
+    for idx, cap in enumerate(cap_cases):
+        case_name = f"caso_{idx+1}"
+        cf_inv, pool = _simulate_investor_cf(cf_post, cap)
+        
+        if cf_inv.ndim == 1:
+            cum_inv = np.cumsum(cf_inv)
+            mco = float(np.abs(min(0.0, np.min(cum_inv))))
+            min_pool = int(np.argmin(pool))
+            pos_idx = np.where(cum_inv[1:] >= 0)[0]
+            payback = float(pos_idx[0] + 1) if len(pos_idx) > 0 else float(n_periods)
+            tirm_val = _safe_mirr_annual(cf_inv, finance_rate_m, reinvest_rate_m)
+            pos_sum = np.sum(cf_inv[cf_inv > 0])
+            neg_sum = np.sum(-cf_inv[cf_inv < 0])
+            moic = float(pos_sum / neg_sum) if neg_sum > 0 else 0.0
+            disc = (1 + monthly_r) ** np.arange(n_periods + 1)
+            npv_val = float(np.sum(cf_inv / disc))
+            
+            cases_dict[case_name] = {
+                'capital': cap,
+                'cf_investor_post_tax': cf_inv[np.newaxis, :],
+                'cum_cf_investor_post_tax': cum_inv[np.newaxis, :],
+                'cash_pool_autofin': pool[np.newaxis, :],
+                'mco_autofin': [mco],
+                'min_pool_months': [min_pool],
+                'payback_months_autofin': [payback],
+                'tirm_investor': tirm_val,
+                'moic_investor': [moic],
+                'npv_investor': [npv_val]
+            }
+        else:
+            cum_inv = np.cumsum(cf_inv, axis=1)
+            mco = np.abs(np.minimum(cum_inv, 0).min(axis=1))
+            min_pool = np.argmin(pool, axis=1)
+            payback = np.full(cf_inv.shape[0], n_periods, dtype=float)
+            for i in range(cf_inv.shape[0]):
+                pos_idx = np.where(cum_inv[i, 1:] >= 0)[0]
+                if len(pos_idx) > 0:
+                    payback[i] = pos_idx[0] + 1
+            mean_cf = np.mean(cf_inv, axis=0)
+            tirm_val = _safe_mirr_annual(mean_cf, finance_rate_m, reinvest_rate_m)
+            pos_sum = np.sum(np.where(cf_inv > 0, cf_inv, 0), axis=1)
+            neg_sum = np.sum(np.where(cf_inv < 0, -cf_inv, 0), axis=1)
+            moic = np.where(neg_sum > 0, pos_sum / neg_sum, 0.0)
+            disc = ((1 + monthly_r) ** np.arange(n_periods + 1))[np.newaxis, :]
+            npv_val = np.sum(cf_inv / disc, axis=1)
+            
+            cases_dict[case_name] = {
+                'capital': cap,
+                'cf_investor_post_tax': cf_inv,
+                'cum_cf_investor_post_tax': cum_inv,
+                'cash_pool_autofin': pool,
+                'mco_autofin': mco,
+                'min_pool_months': min_pool,
+                'payback_months_autofin': payback,
+                'tirm_investor': tirm_val,
+                'moic_investor': moic,
+                'npv_investor': npv_val
+            }
+    return cases_dict, cap_cases
+
+def _ensure_sens_pre_tax(df_s, sc):
+    """
+    Asegura que el dataframe de sensibilidad cuente con la columna 'VPN HPOC Pre (MMUSD)'.
+    Si no está pre-calculada en el archivo, se computa analíticamente con alta precisión.
+    """
+    if 'VPN HPOC Pre (MMUSD)' in df_s.columns and df_s['VPN HPOC Pre (MMUSD)'].notnull().all():
+        return df_s
+    p = sc['params']
+    cf = sc.get('cash_flows', {})
+    dates = sc.get('dates', [])
+    dr = float(p.get('discount_rate', 15.0)) / 100.0
+    mr = (1 + dr) ** (1 / 12) - 1
+    dm = (1 + mr) ** np.arange(len(dates))
+    
+    base_price = float(p.get('oil_price', 60.0))
+    int_tax_rate = float(p.get('integrated_tax_rate', p.get('int_tax_rate', 9.0))) / 100.0
+    
+    costs_pv = float(np.sum((np.array(cf.get('capex', [0])) + np.array(cf.get('opex', [0])) + np.array(cf.get('abex', [0]))) / dm))
+    gi_base_pv = float(np.sum(np.array(cf.get('gross_income', [0])) / dm))
+    
+    pre_vals = []
+    r_cols = [c for c in df_s.columns if 'Regal' in c or 'Royalty' in c]
+    r_col = r_cols[0] if r_cols else None
+    
+    for _, row in df_s.iterrows():
+        if 'VPN HPOC Pre (MMUSD)' in row and pd.notnull(row['VPN HPOC Pre (MMUSD)']):
+            pre_vals.append(float(row['VPN HPOC Pre (MMUSD)']))
+        else:
+            price = float(row['Precio Aceite']) if 'Precio Aceite' in row else float(row.get('Oil Price', base_price))
+            r_rate = float(row[r_col]) / 100.0 if r_col else 0.3
+            scaled_gi_pv = gi_base_pv * (price / base_price) if base_price > 0 else gi_base_pv
+            v_roy = r_rate * scaled_gi_pv
+            v_iih = int_tax_rate * scaled_gi_pv
+            pre_vals.append(scaled_gi_pv - v_roy - v_iih - costs_pv)
+    df_s['VPN HPOC Pre (MMUSD)'] = pre_vals
+    return df_s
+
+
 def find_logo(pattern):
     for ext in ["png", "jpg", "jpeg", "PNG", "JPG"]:
         exact = f"assets/{pattern}.{ext}"
@@ -152,9 +344,38 @@ st.sidebar.markdown("<hr style='border:none; border-top:1px solid #e2e8f0; margi
 st.sidebar.markdown("<h3 style='color: #718096; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;'>PROJECT</h3>", unsafe_allow_html=True)
 
 # ─── DATA LOADING (INSIDE AUTHENTICATED BLOCK) ──────────────────────────────
+def _compress_scenario_data(data):
+    """Compress 2D Monte Carlo matrices to 1D vectors and scalar totals to optimize RAM usage."""
+    cf = data.get('cash_flows', {})
+    cf_opt = {}
+    for k, v in cf.items():
+        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], list):
+            arr = np.array(v, dtype=np.float64)
+            cf_opt[k] = np.round(arr.mean(axis=0), 4).tolist()
+            cf_opt[k + '_nom_total'] = float(np.round(arr.sum(axis=1).mean(), 4))
+        else:
+            cf_opt[k] = v
+    data['cash_flows'] = cf_opt
+
+    prod = data.get('production', {})
+    prod_opt = {}
+    for k in ['Qo', 'NP', 'Qg', 'GP']:
+        if k in prod and isinstance(prod[k], list) and len(prod[k]) > 0 and isinstance(prod[k][0], list):
+            arr = np.array(prod[k], dtype=np.float64)
+            p10, p50, p90 = np.percentile(arr, [10, 50, 90], axis=0)
+            prod_opt[k + '_p10'] = np.round(p10, 4).tolist()
+            prod_opt[k + '_p50'] = np.round(p50, 4).tolist()
+            prod_opt[k + '_p90'] = np.round(p90, 4).tolist()
+    for k, v in prod.items():
+        if k not in ['Qo', 'NP', 'Qg', 'GP']:
+            prod_opt[k] = v
+    data['production'] = prod_opt
+
+    return data
+
 @st.cache_data
 def load_scenarios(cache_key: str):
-    """Load all scenario JSON files. cache_key changes when files are modified on disk."""
+    """Load all scenario JSON files and compress 2D matrices to fit within Streamlit Cloud memory limits."""
     scenarios_dir = "scenarios"
     if not os.path.exists(scenarios_dir):
         return [], []
@@ -168,6 +389,7 @@ def load_scenarios(cache_key: str):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+                data = _compress_scenario_data(data)
                 data['_color'] = PALETTE[idx % len(PALETTE)]
                 data['_filename'] = os.path.basename(filepath)
                 loaded.append(data)
@@ -525,9 +747,40 @@ def hist_plot(data_array, title, color, nom_val=None, nbins=28):
     )
     return fig
 
+def get_cf_monthly(cf_dict, key):
+    """Retrieve 1D monthly mean array for cash flow key."""
+    val = cf_dict.get(key, [])
+    if not len(val):
+        return np.array([])
+    arr = np.array(val, dtype=float)
+    if arr.ndim == 2:
+        return np.mean(arr, axis=0)
+    return arr
+
+def get_p10_p50_p90(prod_dict, key):
+    """Retrieve P10, P50, P90 vectors for production forecast plots."""
+    if key + '_p10' in prod_dict:
+        return (
+            np.array(prod_dict[key + '_p10']),
+            np.array(prod_dict[key + '_p50']),
+            np.array(prod_dict[key + '_p90'])
+        )
+    raw = prod_dict.get(key, [])
+    if len(raw) > 0 and isinstance(raw[0], list):
+        return np.percentile(raw, [10, 50, 90], axis=0)
+    arr = np.array(raw) if len(raw) > 0 else np.zeros(1)
+    return arr, arr, arr
+
 def plot_dual(dates, rate_data, cum_data, res_dict, title, y1_lbl, y2_lbl, color):
-    r10, r50, r90 = np.percentile(rate_data, [10, 50, 90], axis=0)
-    c10, c50, c90 = np.percentile(cum_data,  [10, 50, 90], axis=0)
+    if isinstance(rate_data, tuple):
+        r10, r50, r90 = rate_data
+    else:
+        r10, r50, r90 = np.percentile(rate_data, [10, 50, 90], axis=0)
+        
+    if isinstance(cum_data, tuple):
+        c10, c50, c90 = cum_data
+    else:
+        c10, c50, c90 = np.percentile(cum_data, [10, 50, 90], axis=0)
         
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=dates, y=r10, name='Rate P10', line=dict(color=color, width=1), opacity=0.35))
@@ -567,13 +820,41 @@ metrics = [
 for col, (label, val) in zip(m_cols, metrics):
     col.metric(label, val)
 
+p_sel = sel_sc['params']
+ind_sel = sel_sc['indicators']
+if p_sel.get('aplica_autofin', False):
+    st.markdown("##### 📦 Métricas del Inversionista (Caja Autofinanciable - Caso 2 Base)")
+    card_cols_inv = st.columns(6)
+    tirm_inv_val = ind_sel.get('tirm_investor')
+    tirm_inv_str = f"{float(tirm_inv_val):.2f}%" if (tirm_inv_val is not None and np.isfinite(tirm_inv_val)) else "N/A"
+    payback_inv_val = ind_mean(sel_sc, 'payback_months_autofin')
+    payback_inv_str = f"Mes {int(round(payback_inv_val))}" if payback_inv_val < len(sel_sc.get('dates', [])) else "N/A"
+    metrics_inv = [
+        ("Capital Inicial (C₀)", f"{float(p_sel.get('capital_inicial', 40.0)):.1f} MMUSD"),
+        ("Exposición / MCO",     f"{ind_mean(sel_sc, 'mco_autofin'):.2f} MMUSD"),
+        ("TIRM Inversionista",   tirm_inv_str),
+        ("MOIC Inversionista",   f"{ind_mean(sel_sc, 'moic_investor'):.2f}x"),
+        ("VPN Inversionista",    f"{ind_mean(sel_sc, 'npv_investor'):.2f} MMUSD"),
+        ("Mes Autofinanc.",      payback_inv_str),
+    ]
+    for col, (label, val) in zip(card_cols_inv, metrics_inv):
+        col.metric(label, val)
+
 # ─── SECTION 2: TABS ─────────────────────────────────────────────────────────
 st.markdown(f"### 🔍 Detailed Inspection: {sel_esc_name}")
-t_bubble, t_det1, t_det2, t_det3, t_det4, t_det5, t_det6a, t_det6b, t_det7 = st.tabs([
-    "📊 KPI Analysis", "🏗️ Fiscal Waterfall", "🛢️ Forecasts", "💸 Expenditures", 
-    "📈 NPV Distributions", "💼 Cash Flow", "🎯 Corner Solutions 1", "🎯 Corner Solutions 2",
-    "⚖️ Fiscal Optimization"
+t_bubble, t_det1, t_det2, t_det3, t_det4, t_det5, t_sens, t_gt, t_sens_fiscal, t_autofin = st.tabs([
+    "📊 KPI Comparativo",
+    "🏗️ Cascada Fiscal",
+    "🛢️ Pronósticos",
+    "💸 Egresos",
+    "📈 Distribuciones NPV",
+    "💼 Flujo de Caja",
+    "📊 Indicadores & Sensibilidad",
+    "⚖️ Equilibrio Fiscal / GT",
+    "🔬 Análisis de Sensibilidad Fiscal",
+    "📦 Caja Autofinanciable & Exposición"
 ])
+
 
 # Helpers for aggregations
 dates = sel_sc.get('dates', [])
@@ -581,8 +862,16 @@ cf = sel_sc.get('cash_flows', {})
 ind_det = sel_sc.get('indicators', {})
 
 def nom_total(sc, key):
-    arr = sc['cash_flows'].get(key, [[0.0]])
-    return float(np.mean(np.sum(arr, axis=1)))
+    cf_map = sc.get('cash_flows', {})
+    if key + '_nom_total' in cf_map:
+        return float(cf_map[key + '_nom_total'])
+    val = cf_map.get(key, [[0.0]])
+    arr = np.array(val, dtype=float)
+    if arr.ndim == 2:
+        return float(np.mean(np.sum(arr, axis=1)))
+    elif arr.ndim == 1:
+        return float(np.sum(arr))
+    return float(val)
 
 def safe_agg(arr):
     return {'Mean': np.mean(arr), 'Std Dev': np.std(arr),
@@ -676,20 +965,20 @@ with t_det2:
     prod_sel = sel_sc.get('production', {})
     with r1:
         st.plotly_chart(plot_dual(
-            dates, np.array(prod_sel.get('Qo', [])), np.array(prod_sel.get('NP', [])),
+            dates, get_p10_p50_p90(prod_sel, 'Qo'), get_p10_p50_p90(prod_sel, 'NP'),
             sel_sc.get('reserves_oil', {}), "Oil Production Forecast", "Rate (bpd)", "Cumulative (MMbbls)", "green"
         ), use_container_width=True)
     with r2:
         st.plotly_chart(plot_dual(
-            dates, np.array(prod_sel.get('Qg', [])), np.array(prod_sel.get('GP', [])),
+            dates, get_p10_p50_p90(prod_sel, 'Qg'), get_p10_p50_p90(prod_sel, 'GP'),
             sel_sc.get('reserves_gas', {}), "Gas Production Forecast", "Rate (Mcfd)", "Cumulative (Bcf)", "#d62728"
         ), use_container_width=True)
 
 with t_det3:
     st.subheader("Expected Monthly Expenditures")
-    capex_m = np.mean(cf.get('capex', []), axis=0) if len(cf.get('capex', [])) else []
-    opex_m  = np.mean(cf.get('opex', []), axis=0) if len(cf.get('opex', [])) else []
-    abex_m  = np.mean(cf.get('abex', []), axis=0) if len(cf.get('abex', [])) else []
+    capex_m = get_cf_monthly(cf, 'capex')
+    opex_m  = get_cf_monthly(cf, 'opex')
+    abex_m  = get_cf_monthly(cf, 'abex')
     
     c_cap, c_op, c_ab = st.columns(3)
     card_tpl = """
@@ -753,10 +1042,10 @@ with t_det3:
 
 with t_det4:
     st.subheader("Net Present Value Distributions (MMUSD)")
-    nom_pre   = float(np.mean(np.sum(cf.get('cf_pre_tax', [[0]]),   axis=1)))
-    nom_post  = float(np.mean(np.sum(cf.get('cf_post_tax', [[0]]),  axis=1)))
-    nom_state = float(np.mean(np.sum(cf.get('state_income', [[0]]), axis=1)))
-    nom_roy   = float(np.mean(np.sum(cf.get('royalty', [[0]]),      axis=1)))
+    nom_pre   = nom_total(sel_sc, 'cf_pre_tax')
+    nom_post  = nom_total(sel_sc, 'cf_post_tax')
+    nom_state = nom_total(sel_sc, 'state_income')
+    nom_roy   = nom_total(sel_sc, 'royalty')
 
     dc1, dc2 = st.columns(2)
     with dc1:
@@ -768,13 +1057,16 @@ with t_det4:
 
 with t_det5:
     st.subheader("Expected Cash Flow Analysis")
-    inc_m  = np.mean(cf.get('gross_income', []), axis=0) if len(cf.get('gross_income', [])) else []
+    inc_m  = get_cf_monthly(cf, 'gross_income')
     if len(inc_m) > 0:
-        cost_m = np.mean(np.array(cf['capex']) + np.array(cf['opex']) + np.array(cf['abex']), axis=0)
-        roy_m  = np.mean(cf.get('royalty', []), axis=0)
-        int_m  = np.mean(cf.get('int_tax', []), axis=0)
-        islr_m = np.mean(cf.get('islr', []), axis=0)
-        net_m  = np.mean(cf.get('cf_post_tax', []), axis=0)
+        capex_m = get_cf_monthly(cf, 'capex')
+        opex_m  = get_cf_monthly(cf, 'opex')
+        abex_m  = get_cf_monthly(cf, 'abex')
+        cost_m = capex_m + opex_m + abex_m
+        roy_m  = get_cf_monthly(cf, 'royalty')
+        int_m  = get_cf_monthly(cf, 'int_tax')
+        islr_m = get_cf_monthly(cf, 'islr')
+        net_m  = get_cf_monthly(cf, 'cf_post_tax')
 
         fig_cf = go.Figure()
         fig_cf.add_trace(go.Bar(x=dates, y=inc_m,   name='Gross Revenue',       marker_color='#17becf'))
@@ -791,520 +1083,667 @@ with t_det5:
                              paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', margin=dict(b=100), hovermode='x unified')
         st.plotly_chart(fig_cf, use_container_width=True)
 
-with t_det6a:
+# ─── TAB 7: INDICADORES & SENSIBILIDAD ───────────────────────────────────────
+with t_sens:
     _oil_p  = sel_sc.get('params', {}).get('oil_price', '—')
     _gas_p  = sel_sc.get('params', {}).get('gas_price', '—')
     st.markdown(
-        f"<div style='display:flex; align-items:baseline; gap:24px; flex-wrap:wrap; margin-bottom:8px;'>"
-        f"<span style='font-size:1.35rem; font-weight:800; color:#0c1c3e;'>Economic Indicators Summary</span>"
-        f"<span style='font-size:0.88rem; color:#64748b; font-weight:600;'>"
-        f"Oil Price: <span style='color:#0c1c3e;'>${_oil_p:.2f} USD/bl</span>"
-        f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-        f"Gas Price: <span style='color:#0c1c3e;'>${_gas_p:.2f} USD/mcf</span>"
-        f"</span></div>",
+        f"<div style='display:flex; justify-content:space-between; align-items:baseline; margin-bottom:20px; border-bottom:3px solid #012743; padding-bottom:12px;'>"
+        f"<h2 style='margin:0; color:#012743; font-family:Inter,sans-serif; font-size:1.85rem; font-weight:700;'>Resumen de Indicadores Económicos</h2>"
+        f"<div style='color:#4a5568; font-size:0.95rem; font-family:Inter,sans-serif; background:#f8fafc; padding:5px 15px; border-radius:20px; border:1px solid #e2e8f0;'>"
+        f"<b>Precio Aceite:</b> <span style='color:#012743; font-weight:700;'>${float(_oil_p):.2f} USD/bl</span> | "
+        f"<b>Precio Gas:</b> <span style='color:#012743; font-weight:700;'>${float(_gas_p):.2f} USD/mcf</span>"
+        f"</div></div>",
         unsafe_allow_html=True
     )
-    df_sum = pd.DataFrame({
-        "PV Royalties (MMUSD)":         safe_agg(ind_det.get('npv_royalty', [0])),
-        "PV Integrated Tax (MMUSD)":    safe_agg(ind_det.get('npv_int_tax', [0])),
-        "PV Income Tax (ISLR) (MMUSD)": safe_agg(ind_det.get('npv_islr', [0])),
-        "PV Total State Take (MMUSD)":  safe_agg(ind_det.get('npv_state', [0])),
-        "NPV Contractor Pre-Tax (MMUSD)": safe_agg(ind_det.get('npv_hpoc_pre', [0])),
-        "NPV Contractor Post-Tax (MMUSD)":safe_agg(ind_det.get('npv_hpoc_post', [0])),
-        "Peak Investment (MCE) (MMUSD)": safe_agg(ind_det.get('mce_mm', [0])),
-        "Payout Time (Years)":           safe_agg(ind_det.get('payout_years', [0])),
-        "MOIC (Multiple)":               safe_agg(ind_det.get('moic', [0])),
-        "Break-even (USD/bbl)":          safe_agg(ind_det.get('breakeven_price', [0])),
-        "Maximum Contractor Financing Requirement (MMUSD)": safe_agg(ind_det.get('max_financing_mm', [0])),
-        "Government Take (%)":           safe_agg(ind_det.get('npv_gov_take', [0])),
-    }).T
     
-    # Estructura de grupos e indicadores para el HTML
-    groups = [
-        ("Present Value (PV) Indicators", [
-            "PV Royalties (MMUSD)", "PV Integrated Tax (MMUSD)", 
-            "PV Income Tax (ISLR) (MMUSD)", "PV Total State Take (MMUSD)"
-        ]),
-        ("NPV HPOC (High Performance Operation Consortia Profitability)", [
-            "NPV Contractor Pre-Tax (MMUSD)", "NPV Contractor Post-Tax (MMUSD)"
-        ]),
-        ("Operational Efficiency and Capital Recovery", [
-            "Peak Investment (MCE) (MMUSD)", "Payout Time (Years)", 
-            "MOIC (Multiple)", "Break-even (USD/bbl)", 
-            "Maximum Contractor Financing Requirement (MMUSD)"
-        ]),
-        ("International Competitiveness Measure", [
-            "Government Take (%)"
-        ])
+    ind_dict = sel_sc.get('indicators', {})
+    
+    def _agg_list(arr):
+        a = np.asarray(arr, dtype=float)
+        if a.size == 0: return [0.0]*7
+        return [np.mean(a), np.std(a), np.min(a), np.percentile(a,10), 
+                np.percentile(a,50), np.percentile(a,90), np.max(a)]
+
+    summary_rows = [
+        ("VP de los Ingresos", "VP Ingresos por Aceite (MMUSD)", _agg_list(ind_dict.get('npv_oil_income', [0]))),
+        ("VP de los Ingresos", "VP Ingresos por Gas (MMUSD)", _agg_list(ind_dict.get('npv_gas_income', [0]))),
+        ("Indicadores de Valor Presente (VP)", "VP Regalías (MMUSD)", _agg_list(ind_dict.get('npv_royalty', [0]))),
+        ("Indicadores de Valor Presente (VP)", "VP Impuesto Integrado (MMUSD)", _agg_list(ind_dict.get('npv_int_tax', [0]))),
+        ("Indicadores de Valor Presente (VP)", "VP Impuesto sobre la Renta (ISLR) (MMUSD)", _agg_list(ind_dict.get('npv_islr', [0]))),
+        ("Indicadores de Valor Presente (VP)", "VP Participación Total del Estado (MMUSD)", _agg_list(ind_dict.get('npv_state', [0]))),
+        ("VPN HPOC (Rentabilidad Operativa)", "VPN Contratista Pre-Impuesto (MMUSD)", _agg_list(ind_dict.get('npv_hpoc_pre', [0]))),
+        ("VPN HPOC (Rentabilidad Operativa)", "VPN Contratista Post-Impuesto (MMUSD)", _agg_list(ind_dict.get('npv_hpoc_post', [0]))),
+        ("Eficiencia Operativa y Recuperación", "Pico de Inversión (MCE) (MMUSD)", _agg_list(ind_dict.get('mce_mm', [0]))),
+        ("Eficiencia Operativa y Recuperación", "Tiempo de Recuperación (Años)", _agg_list(ind_dict.get('payout_years', [0]))),
+        ("Eficiencia Operativa y Recuperación", "MOIC (Múltiplo de Inversión)", _agg_list(ind_dict.get('moic', [0]))),
+        ("Eficiencia Operativa y Recuperación", "Punto de Equilibrio (USD/bbl)", _agg_list(ind_dict.get('breakeven_price', [0]))),
+        ("Eficiencia Operativa y Recuperación", "Máximo Requerimiento de Financiamiento (MMUSD)", _agg_list(ind_dict.get('max_financing_mm', [0]))),
+        ("Medida de Competitividad Internacional", "Government Take (%)", _agg_list(ind_dict.get('npv_gov_take', [0])))
     ]
-    
-    # Generación de tabla HTML con celdas combinadas (rowspan)
-    html_table = """
+
+    cat_counts = {}
+    for r in summary_rows:
+        cat_counts[r[0]] = cat_counts.get(r[0], 0) + 1
+
+    table_html = """
     <style>
-        .custom-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            font-size: 13px;
-            color: #334155;
-            background-color: white;
-            border-radius: 4px;
-        }
-        .custom-table th {
-            background-color: #f8fafc;
-            color: #475569;
-            font-weight: 600;
-            padding: 10px;
-            border: 1px solid #e2e8f0;
-            text-align: center;
-        }
-        .custom-table td {
-            padding: 8px 12px;
-            border: 1px solid #e2e8f0;
-        }
-        .group-header {
-            background-color: #ffffff;
-            font-weight: bold;
-            color: #1e293b;
-            vertical-align: middle;
-            text-align: left;
-            width: 240px;
-        }
-        .indicator-name {
-            background-color: #fcfcfc;
-        }
-        .val-cell {
-            text-align: right;
-            font-family: 'Courier New', Courier, monospace;
-        }
-        .custom-table tr:hover {
-            background-color: #f1f5f9;
-        }
+        .premium-table { width: 100%; border-collapse: collapse; margin-bottom: 25px; font-family: 'Inter', sans-serif; font-size: 0.88rem; background-color: white; border: 1px solid #e2e8f0; }
+        .premium-table th { background-color: #012743; color: white; text-align: center; padding: 12px 10px; font-weight: 600; border: 1px solid #1d3d5a; text-transform: uppercase; letter-spacing: 0.5px; }
+        .premium-table td { padding: 10px; border: 1px solid #e2e8f0; text-align: center; color: #2d3748; }
+        .premium-table .group-header { background-color: #ffffff; font-weight: 700; color: #012743; text-align: left; padding-left: 15px; width: 22%; border-right: 2px solid #cbd5e0; vertical-align: middle; }
+        .premium-table .indicator-name { text-align: left; padding-left: 15px; width: 28%; font-weight: 500; color: #4a5568; }
+        .premium-table tr:nth-child(even) { background-color: #f8fafc; }
+        .premium-table tr:hover { background-color: #f1f5f9; }
+        .premium-table .val-cell { font-family: 'Courier New', monospace; font-weight: 600; text-align: right; }
     </style>
-    <table class="custom-table">
+    <table class="premium-table">
         <thead>
             <tr>
-                <th>Classification</th>
-                <th>Indicator</th>
-                <th>Mean</th>
-                <th>Std Dev</th>
-                <th>Min</th>
-                <th>P10</th>
-                <th>P50</th>
-                <th>P90</th>
-                <th>Max</th>
+                <th>Clasificación</th><th>Indicador</th><th>Media</th><th>Desv. Est.</th>
+                <th>Mín</th><th>P10</th><th>P50</th><th>P90</th><th>Máx</th>
             </tr>
         </thead>
         <tbody>
     """
-    
-    for cat_name, ind_list in groups:
-        for i, ind_name in enumerate(ind_list):
-            html_table += "<tr>"
-            if i == 0:
-                html_table += f'<td class="group-header" rowspan="{len(ind_list)}">{cat_name}</td>'
-            
-            # Obtener valores de la fila
-            if ind_name in df_sum.index:
-                vals = df_sum.loc[ind_name]
-                html_table += f'<td class="indicator-name">{ind_name}</td>'
-                for val in vals:
-                    html_table += f'<td class="val-cell">{val:,.2f}</td>'
-            html_table += "</tr>"
-            
-    html_table += "</tbody></table>"
-    st.markdown(html_table, unsafe_allow_html=True)
+    curr_cat = None
+    for cat, ind_name, vals in summary_rows:
+        table_html += "<tr>"
+        if cat != curr_cat:
+            table_html += f'<td class="group-header" rowspan="{cat_counts[cat]}">{cat}</td>'
+            curr_cat = cat
+        table_html += f'<td class="indicator-name">{ind_name}</td>'
+        for v in vals:
+            table_html += f'<td class="val-cell">{v:,.2f}</td>'
+        table_html += "</tr>"
+    table_html += "</tbody></table>"
+    st.markdown(table_html, unsafe_allow_html=True)
+
+    # ─── TIRM Cards ───
     st.markdown("<br>", unsafe_allow_html=True)
-
     c_irr1, c_irr2 = st.columns(2)
-    with c_irr1: st.metric("IRR Pre-Tax (% Annual)",  f"{ind_det.get('irr_pre_annual', 0.0):.2f}%")
-    with c_irr2: st.metric("IRR Post-Tax (% Annual)", f"{ind_det.get('irr_post_annual', 0.0):.2f}%")
+    tirm_pre_val = ind_dict.get('irr_pre_annual')
+    tirm_post_val = ind_dict.get('irr_post_annual')
+    disc_r = float(sel_sc['params'].get('discount_rate', 15.0))
 
-    # ── CORNER SOLUTIONS 1: Price-filtered unified table ──────────────────────
+    def _fmt_tirm(val):
+        try:
+            if val is None or not np.isfinite(float(val)): return "N/A"
+            return f"{float(val):.2f}%"
+        except Exception:
+            return "N/A"
+
+    def _irr_color(val):
+        if val is None: return "#a0aec0"
+        try:
+            v = float(val)
+            if v >= disc_r: return "#16a34a"
+            if v >= 0: return "#d97706"
+            return "#dc2626"
+        except Exception:
+            return "#a0aec0"
+
+    card_irr_tpl = """
+    <div style="background: white; border-left: 5px solid #00d4ff; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); height: 100%;">
+        <div style="color: #6c757d; font-size: 0.8rem; font-weight: 700; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 1px;">{label}</div>
+        <div style="color: {color}; font-size: 2.8rem; font-weight: 800; line-height: 1;">{value}</div>
+        <div style="color: #a0aec0; font-size: 0.72rem; margin-top: 8px; font-style: italic;">TIRM — Tasa Interna de Retorno Modificada (anual efectiva)</div>
+    </div>
+    """
+    with c_irr1:
+        st.markdown(card_irr_tpl.format(label="TIRM PRE-TAX (% ANUAL)", value=_fmt_tirm(tirm_pre_val), color=_irr_color(tirm_pre_val)), unsafe_allow_html=True)
+    with c_irr2:
+        st.markdown(card_irr_tpl.format(label="TIRM POST-TAX (% ANUAL)", value=_fmt_tirm(tirm_post_val), color=_irr_color(tirm_post_val)), unsafe_allow_html=True)
+
+    st.caption(
+        f"💡 **TIRM (Tasa Interna de Retorno Modificada):** Equivalente a `TIRM()` de Excel. "
+        f"Flujos negativos financiados y flujos positivos reinvertidos a la tasa de descuento del proyecto ({disc_r:.1f}% anual)."
+    )
+
+    # ─── SENSITIVITY MATRIX (AS IN USER IMAGE) ───
     st.markdown("---")
-    st.subheader("Corner Solutions 1: Indicators by Oil Price")
-    st.markdown("Select an oil price to view all key indicators across each evaluated Royalty rate (%)")
+    st.subheader("Análisis de Sensibilidad: Regalías vs Precio Aceite")
     
-    sens_data_cs1 = sel_sc.get('sensibilidad', [])
-    if sens_data_cs1:
-        df_cs1 = pd.DataFrame(sens_data_cs1)
+    sens_raw = sel_sc.get('sensibilidad', [])
+    prices_found = sorted(list({float(d.get('Precio Aceite', d.get('Oil Price', 0))) for d in sens_raw if 'Precio Aceite' in d or 'Oil Price' in d}))
+    p_defaults = [50.0, 60.0, 70.0, 80.0]
+    if len(prices_found) >= 4:
+        p_defaults = prices_found[:4]
+
+    cs1, cs2, cs3, cs4 = st.columns(4)
+    with cs1: p1 = st.number_input("Precio 1 (USD/bl)", value=float(p_defaults[0]), step=5.0, key=f"s_p1_{sel_esc_name}")
+    with cs2: p2 = st.number_input("Precio 2 (USD/bl)", value=float(p_defaults[1]), step=5.0, key=f"s_p2_{sel_esc_name}")
+    with cs3: p3 = st.number_input("Precio 3 (USD/bl)", value=float(p_defaults[2]), step=5.0, key=f"s_p3_{sel_esc_name}")
+    with cs4: p4 = st.number_input("Precio 4 (USD/bl)", value=float(p_defaults[3]), step=5.0, key=f"s_p4_{sel_esc_name}")
+
+    st.button("Ejecutar Sensibilidad", type="primary", key=f"btn_exec_sens_{sel_esc_name}")
+
+    if sens_raw:
+        df_sens_tab5 = pd.DataFrame(sens_raw)
         
-        def rename_col_cs1(col):
-            if 'Precio' in col or 'Oil' in col: return 'Oil Price'
-            if 'Regal' in col or 'Royalty' in col: return 'Royalty (%)'
-            if 'VPN HPOC Post' in col: return 'NPV Contractor Post-Tax (MMUSD)'
-            if 'Gov Take' in col: return 'Government Take (%)'
-            if 'MCE' in col or 'Peak' in col: return 'Peak Inv. (MCE) (MMUSD)'
-            if 'Payout' in col: return 'Payout Time (Years)'
-            if 'Max Financ' in col: return 'Max Financing Req. (MMUSD)'
-            if 'Break-even' in col or 'Punto' in col: return 'Break-even (USD/bbl)'
-            return col
-        
-        df_cs1.columns = [rename_col_cs1(c) for c in df_cs1.columns]
-        
-        available_prices = sorted(df_cs1['Oil Price'].unique())
-        selected_price = st.selectbox(
-            "🛢️ Select Oil Price (USD/bbl)",
-            options=available_prices,
-            format_func=lambda x: f"${x:.1f} / bbl",
-            key="cs1_price_selector"
-        )
-        
-        df_filtered = df_cs1[df_cs1['Oil Price'] == selected_price].copy()
-        royalty_cols = sorted(df_filtered['Royalty (%)'].unique())
-        
-        # Indicators and their classifications
-        cs1_groups = [
-            ("NPV HPOC (High Performance\nOperation Consortia Profitability)", [
-                ("NPV Contractor Post-Tax (MMUSD)", "NPV Contractor Post-Tax (MMUSD)")
-            ]),
-            ("Operational Efficiency and\nCapital Recovery", [
-                ("Max Financing Req. (MMUSD)",   "Max Financing Req. (MMUSD)"),
-                ("Peak Investment (MCE) (MMUSD)", "Peak Inv. (MCE) (MMUSD)"),
-                ("Break-even (USD/bbl)",           "Break-even (USD/bbl)"),
-                ("Payout Time (Years)",             "Payout Time (Years)"),
-            ]),
-            ("International Competitiveness\nMeasure", [
-                ("Government Take (%)", "Government Take (%)")
-            ]),
+        def _norm_s_col(c):
+            if 'Precio' in c or 'Oil' in c: return 'Precio Aceite'
+            if 'Regal' in c or 'Royalty' in c: return 'Regalía (%)'
+            if 'VPN HPOC Post' in c: return 'VPN HPOC Post (MMUSD)'
+            if 'VPN HPOC Pre' in c: return 'VPN HPOC Pre (MMUSD)'
+            if 'Gov Take' in c: return 'Gov Take (%)'
+            if 'MCE' in c or 'Peak' in c: return 'MCE (MMUSD)'
+            if 'Payout' in c: return 'Payout (Years)'
+            if 'Max Financ' in c: return 'Max Financ. (MMUSD)'
+            if 'Break-even' in c or 'Punto' in c: return 'Break-even (USD/bbl)'
+            if 'TIRM' in c or 'IRR' in c: return 'TIRM Post-Tax (%)'
+            return c
+
+        df_sens_tab5.columns = [_norm_s_col(c) for c in df_sens_tab5.columns]
+        df_sens_tab5 = _ensure_sens_pre_tax(df_sens_tab5, sel_sc)
+
+        expected_sens_cols = [
+            'VPN HPOC Pre (MMUSD)', 'VPN HPOC Post (MMUSD)', 'Max Financ. (MMUSD)',
+            'Gov Take (%)', 'TIRM Post-Tax (%)', 'Break-even (USD/bbl)',
+            'Payout (Years)', 'MCE (MMUSD)'
         ]
-        
-        # Build lookup: indicator_col -> {royalty: value}
-        lookup = {}
-        for _, row in df_filtered.iterrows():
-            r = row['Royalty (%)']
-            for ind_label, ind_col in [(t[0], t[1]) for grp, inds in cs1_groups for t in inds]:
-                if ind_col not in lookup:
-                    lookup[ind_col] = {}
-                if ind_col in row:
-                    lookup[ind_col][r] = row[ind_col]
-        
-        # Color maps per indicator (for gradient)
-        cmap_cfg = {
-            "NPV Contractor Post-Tax (MMUSD)": ("Blues", False),
-            "Max Financing Req. (MMUSD)":      ("Oranges", False),
-            "Peak Inv. (MCE) (MMUSD)":         ("YlOrRd_r", False),
-            "Break-even (USD/bbl)":             ("YlOrRd", False),
-            "Payout Time (Years)":              ("YlGn_r", False),
-            "Government Take (%)": ("Reds", False),
-        }
-        
-        # Royalty columns header
-        r_col_headers = "".join([f"<th style='text-align:center; min-width:75px;'>{r:.0f}%</th>" for r in royalty_cols])
-        
-        cs1_html = textwrap.dedent(f"""
-            <style>
-                .cs1-table {{ width:100%; border-collapse:collapse; font-family:'Segoe UI',sans-serif; font-size:12.5px; color:#334155; }}
-                .cs1-table th {{ background:#f8fafc; color:#475569; font-weight:600; padding:9px 10px; border:1px solid #e2e8f0; }}
-                .cs1-table td {{ padding:7px 10px; border:1px solid #e2e8f0; }}
-                .cs1-group {{ background:#fff; font-weight:700; color:#1e293b; vertical-align:middle; width:200px; line-height:1.4; }}
-                .cs1-ind {{ background:#fcfcfc; }}
-                .cs1-val {{ text-align:right; font-family:'Courier New',monospace; font-size:12px; }}
-                .cs1-table tr:hover td {{ background:#f1f5f9; }}
-            </style>
-            <table class="cs1-table">
-            <thead><tr>
-                <th>Classification</th>
-                <th>Indicator</th>
-                {r_col_headers}
-            </tr></thead>
-            <tbody>
-        """).strip()
-        
-        for cat_name, ind_list in cs1_groups:
-            for i, (ind_label, ind_col) in enumerate(ind_list):
-                cs1_html += "<tr>"
-                if i == 0:
-                    cs1_html += f'<td class="cs1-group" rowspan="{len(ind_list)}" style="white-space:pre-line;">{cat_name}</td>'
-                cs1_html += f'<td class="cs1-ind">{ind_label}</td>'
-                for r in royalty_cols:
-                    val = lookup.get(ind_col, {}).get(r, float('nan'))
-                    fmt = f"{val:,.2f}" if not pd.isna(val) else "—"
-                    cs1_html += f'<td class="cs1-val">{fmt}</td>'
-                cs1_html += "</tr>"
-        
-        cs1_html += "</tbody></table>"
-        st.markdown(cs1_html, unsafe_allow_html=True)
-    else:
-        st.warning("⚠️ No sensitivity data found for Corner Solutions 1.")
+        for col in expected_sens_cols:
+            if col not in df_sens_tab5.columns:
+                df_sens_tab5[col] = np.nan
 
-with t_det6b:
-    st.subheader("Corner Solutions 2: Royalties vs Oil Price")
-    sens_data = sel_sc.get('sensibilidad', [])
-    if sens_data:
-        df_s = pd.DataFrame(sens_data)
-        def rename_col(col):
-            if 'Precio' in col or 'Oil' in col: return 'Oil Price'
-            if 'Regal' in col or 'Royalty' in col: return 'Royalty (%)'
-            if 'VPN HPOC Post' in col: return 'NPV Contractor Post-Tax (MMUSD)'
-            if 'Gov Take' in col: return 'Government Take (%)'
-            if 'MCE' in col or 'Peak' in col: return 'Peak Inv. (MCE) (MMUSD)'
-            if 'Payout' in col: return 'Payout Time (Years)'
-            if 'Max Financ' in col: return 'Max Financing Req. (MMUSD)'
-            if 'Break-even' in col or 'Punto' in col: return 'Break-even (USD/bbl)'
-            return col
-            
-        df_s.columns = [rename_col(c) for c in df_s.columns]
+        target_prices = [p1, p2, p3, p4]
+        df_sens_tab5['Precio_Match'] = df_sens_tab5['Precio Aceite'].apply(lambda x: min(target_prices, key=lambda t: abs(t - x)))
+        
+        def _mk_pivot(col):
+            piv = df_sens_tab5.pivot_table(index='Regalía (%)', columns='Precio_Match', values=col, aggfunc='mean')
+            piv = piv.sort_index(ascending=True)
+            return piv
 
-        pivot_h = df_s.pivot(index='Royalty (%)', columns='Oil Price', values='NPV Contractor Post-Tax (MMUSD)')
-        pivot_g = df_s.pivot(index='Royalty (%)', columns='Oil Price', values='Government Take (%)')
-        pivot_m = df_s.pivot(index='Royalty (%)', columns='Oil Price', values='Peak Inv. (MCE) (MMUSD)')
-        pivot_p = df_s.pivot(index='Royalty (%)', columns='Oil Price', values='Payout Time (Years)')
-        pivot_f = df_s.pivot(index='Royalty (%)', columns='Oil Price', values='Max Financing Req. (MMUSD)')
-        pivot_b = df_s.pivot(index='Royalty (%)', columns='Oil Price', values='Break-even (USD/bbl)')
+        pivot_pre  = _mk_pivot('VPN HPOC Pre (MMUSD)')
+        pivot_post = _mk_pivot('VPN HPOC Post (MMUSD)')
+        pivot_mf   = _mk_pivot('Max Financ. (MMUSD)')
+        pivot_gt   = _mk_pivot('Gov Take (%)')
+        pivot_tirm = _mk_pivot('TIRM Post-Tax (%)')
+        pivot_be   = _mk_pivot('Break-even (USD/bbl)')
 
+        # Fila 1 de Matrices de Calor
         r1_c1, r1_c2, r1_c3 = st.columns(3)
         with r1_c1:
-            st.markdown("#### NPV Contractor Post-Tax (MMUSD)")
-            st.dataframe(pivot_h.style.format("{:.1f}").background_gradient(cmap='Blues'), use_container_width=True)
+            st.markdown("#### VPN HPOC Pre-Tax (MMUSD)")
+            st.dataframe(pivot_pre.style.background_gradient(cmap='Blues').format("{:.1f}"), use_container_width=True)
         with r1_c2:
-            st.markdown("#### Max Financing Req. (MMUSD)")
-            st.dataframe(pivot_f.style.format("{:.1f}").background_gradient(cmap='Oranges'), use_container_width=True)
+            st.markdown("#### VPN HPOC Post-Tax (MMUSD)")
+            st.dataframe(pivot_post.style.background_gradient(cmap='Blues').format("{:.1f}"), use_container_width=True)
         with r1_c3:
-            st.markdown("#### Peak Investment (MCE) (MMUSD)")
-            st.dataframe(pivot_m.style.format("{:.1f}").background_gradient(cmap='YlOrRd_r'), use_container_width=True)
+            st.markdown("#### Máx. Req. Financiamiento (MMUSD)")
+            st.dataframe(pivot_mf.style.background_gradient(cmap='Oranges').format("{:.1f}"), use_container_width=True)
 
+        # Fila 2 de Matrices de Calor
         r2_c1, r2_c2, r2_c3 = st.columns(3)
         with r2_c1:
             st.markdown("#### Government Take (%)")
-            st.dataframe(pivot_g.style.format("{:.2f}%").background_gradient(cmap='Reds'), use_container_width=True)
+            st.dataframe(pivot_gt.style.background_gradient(cmap='Reds').format("{:.2f}%"), use_container_width=True)
         with r2_c2:
-            st.markdown("#### Break-even (USD/bbl)")
-            st.dataframe(pivot_b.style.format("{:.2f}").background_gradient(cmap='YlOrRd_r'), use_container_width=True)
+            st.markdown("#### TIRM Post-Tax (% anual)")
+            if pivot_tirm.notnull().any().any():
+                st.dataframe(pivot_tirm.style.background_gradient(cmap='Greens').format("{:.2f}%"), use_container_width=True)
+            else:
+                st.dataframe(pivot_post.style.background_gradient(cmap='Greens').format("{:.1f}"), use_container_width=True)
         with r2_c3:
-            st.markdown("#### Payout Time (Years)")
-            st.dataframe(pivot_p.style.format("{:.2f}").background_gradient(cmap='YlGn_r'), use_container_width=True)
-    else:
-        st.warning("⚠️ No pre-calculated sensitivity data found in this scenario file.")
+            st.markdown("#### Punto de Equilibrio (USD/bbl)")
+            st.dataframe(pivot_be.style.background_gradient(cmap='YlOrRd_r').format("{:.2f}"), use_container_width=True)
 
-    # ── Fiscal Sensitivity Analysis (interactive) ─────────────────────────────
-    st.markdown("---")
+        # ─── Corner Solutions 1: Indicators by Oil Price ───
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(f"""
+        <div style="border-bottom: 3px solid #012743; padding-bottom: 10px; margin-bottom: 20px;">
+            <h2 style="margin: 0; color: #012743; font-family: 'Inter', sans-serif; font-size: 1.6rem; font-weight: 700;">Corner Solutions 1: Indicators by Oil Price</h2>
+            <p style="color: #64748b; font-size: 0.95rem; margin-top: 5px;">Select an oil price to view all key indicators across each evaluated Royalty rate (%)</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        cs1_prices = sorted(df_sens_tab5['Precio Aceite'].unique())
+        sel_cs1_p = st.selectbox("🛢️ Select Oil Price (USD/bbl)", options=cs1_prices, format_func=lambda x: f"${x:.1f} / bbl", key=f"cs1_p_{sel_esc_name}")
+        df_cs1_sub = df_sens_tab5[df_sens_tab5['Precio Aceite'] == sel_cs1_p].sort_values('Regalía (%)')
+        roy_cols_cs1 = sorted(df_cs1_sub['Regalía (%)'].unique())
+
+        def _get_cs1_row(col_name):
+            return [df_cs1_sub[df_cs1_sub['Regalía (%)'] == r][col_name].values[0] if len(df_cs1_sub[df_cs1_sub['Regalía (%)'] == r]) > 0 else np.nan for r in roy_cols_cs1]
+
+        corner_rows = [
+            ("NPV HPOC (High Performance Operation Consortia Profitability)", "NPV Contractor Post-Tax (MMUSD)", _get_cs1_row('VPN HPOC Post (MMUSD)')),
+            ("Operational Efficiency and Capital Recovery", "Max Financing Req. (MMUSD)", _get_cs1_row('Max Financ. (MMUSD)')),
+            ("Operational Efficiency and Capital Recovery", "Peak Investment (MCE) (MMUSD)", _get_cs1_row('MCE (MMUSD)')),
+            ("Operational Efficiency and Capital Recovery", "Break-even (USD/bbl)", _get_cs1_row('Break-even (USD/bbl)')),
+            ("Operational Efficiency and Capital Recovery", "Payout Time (Years)", _get_cs1_row('Payout (Years)')),
+            ("International Competitiveness Measure", "Government Take (%)", _get_cs1_row('Gov Take (%)'))
+        ]
+
+        corner_counts = {}
+        for r in corner_rows:
+            corner_counts[r[0]] = corner_counts.get(r[0], 0) + 1
+
+        corner_html = f"""
+        <table class="premium-table">
+            <thead>
+                <tr>
+                    <th>Classification</th><th>Indicator</th>
+                    {" ".join([f"<th>{r:.0f}%</th>" for r in roy_cols_cs1])}
+                </tr>
+            </thead>
+            <tbody>
+        """
+        c_curr_cat = None
+        for cat, ind_lbl, vals in corner_rows:
+            corner_html += "<tr>"
+            if cat != c_curr_cat:
+                corner_html += f'<td class="group-header" rowspan="{corner_counts[cat]}">{cat}</td>'
+                c_curr_cat = cat
+            corner_html += f'<td class="indicator-name">{ind_lbl}</td>'
+            for v in vals:
+                fmt_v = f"{v:,.2f}" if pd.notnull(v) else "—"
+                corner_html += f'<td class="val-cell">{fmt_v}</td>'
+            corner_html += "</tr>"
+        corner_html += "</tbody></table>"
+        st.markdown(corner_html, unsafe_allow_html=True)
+    else:
+        st.warning("⚠️ No se encontraron datos de sensibilidad precalculados en este escenario.")
+
+
+# ─── TAB 8: EQUILIBRIO FISCAL / GT ──────────────────────────────────────────
+with t_gt:
+    st.header("⚖️ Sensibilidad de Equilibrio Fiscal (Government Take)")
     st.markdown("""
-    <div style="border-bottom: 3px solid #0c1c3e; padding-bottom: 10px; margin-bottom: 20px;">
-        <h2 style="margin:0; font-family:'Segoe UI',sans-serif; color:#0c1c3e; font-size:1.8rem; font-weight:800;">
-            🔬 Fiscal Sensitivity Analysis
-        </h2>
-        <p style="color:#718096; margin-top:6px; font-size:0.95rem;">
-            Multidimensional evaluation of Oil Price vs. Royalty Rate — Powered by STORM-Viewer
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    Esta herramienta busca las combinaciones de **Regalía**, **Impuesto Integrado** e **ISLR** que cumplen con un objetivo de **Government Take (GT)**.
+    Los resultados se ordenan de mayor a menor rentabilidad para el contratista (**VPN Post-Tax**).
+    """)
+    
+    col_gt1, col_gt2 = st.columns([1, 2])
+    with col_gt1:
+        target_gt = st.number_input("Objetivo Government Take (%)", min_value=1.0, max_value=99.0, value=float(sel_sc['params'].get('target_gt', 50.0)), step=1.0, key=f"tgt_{sel_esc_name}")
+        tolerance = st.slider("Tolerancia (+/- %)", 0.1, 5.0, 1.0, step=0.1, key=f"tol_{sel_esc_name}")
+        precision = st.radio("Precisión de búsqueda", ["Fina (1%)", "Media (2%)", "Gruesa (5%)"], index=0, horizontal=True, key=f"prec_{sel_esc_name}")
+    
+    with col_gt2:
+        st.info(f"Se buscarán combinaciones que resulten en un GT entre **{(target_gt - tolerance):.1f}%** y **{(target_gt + tolerance):.1f}%**.")
+        st.caption("Esta herramienta evalúa miles de combinaciones fiscales instantáneamente a partir de los ingresos y egresos del proyecto.")
 
-    sens_data_t8 = sel_sc.get('sensibilidad', [])
+    st.markdown("### ⚙️ Rangos de Sensibilidad Fiscal")
+    st.caption("Define los límites de búsqueda para cada parámetro. Se muestran los límites legales para referencia.")
+    cr1, cr2, cr3 = st.columns(3)
+    with cr1:
+        range_royalty = st.slider("Regalía (%)", 0, 30, (20, 30), step=1, key=f"r_roy_{sel_esc_name}")
+        st.caption("Mín: 0% | Máx: 30% (Ley 2026)")
+    with cr2:
+        range_int_tax = st.slider("Impuesto Integrado (%)", 0, 15, (5, 15), step=1, key=f"r_int_{sel_esc_name}")
+        st.caption("Mín: 0% | Máx: 15% (Ley 2026)")
+    with cr3:
+        range_islr = st.slider("ISLR (%)", 0, 50, (0, 50), step=1, key=f"r_islr_{sel_esc_name}")
+        st.caption("Mín: 0% | Máx: 50% (Ley 2026)")
 
-    if not sens_data_t8:
-        st.info("💡 No sensitivity data found in this scenario file. Please ensure the JSON export includes a 'sensibilidad' key with price/royalty sensitivity results.")
+    st.markdown("---")
+    exec_gt_search = st.button("🔍 Buscar Combinaciones Óptimas", type="primary", key=f"btn_gt_{sel_esc_name}")
+
+    gt_store_key = f"gt_df_{sel_esc_name}"
+    
+    # Initialize from scenario optimizacion_fiscal if available
+    if gt_store_key not in st.session_state and sel_sc.get('optimizacion_fiscal'):
+        df_init_gt = pd.DataFrame(sel_sc['optimizacion_fiscal'])
+        def _norm_gt_col(c):
+            if 'Regal' in c or 'Royalty' in c: return 'Regalía (%)'
+            if 'Integrado' in c: return 'Imp. Integrado (%)'
+            if 'ISLR' in c or 'Income' in c: return 'ISLR (%)'
+            if 'Pre' in c: return 'VPN HPOC Pre-Tax (MMUSD)'
+            if 'Post' in c: return 'VPN HPOC Post-Tax (MMUSD)'
+            if 'Gov' in c or 'Take' in c: return 'Government Take (%)'
+            return c
+        df_init_gt.columns = [_norm_gt_col(c) for c in df_init_gt.columns]
+        st.session_state[gt_store_key] = df_init_gt
+
+    if exec_gt_search:
+        with st.spinner("Realizando búsqueda ultra-rápida..."):
+            dr = float(sel_sc['params'].get('discount_rate', 15.0)) / 100.0
+            mr = (1 + dr) ** (1 / 12) - 1
+            n_per = len(sel_sc.get('dates', []))
+            dm = (1 + mr) ** np.arange(n_per)
+            
+            cf_b = sel_sc.get('cash_flows', {})
+            gi_pv = float(np.sum(np.array(cf_b.get('gross_income', [0])) / dm))
+            costs_pv = float(np.sum((np.array(cf_b.get('capex', [0])) + np.array(cf_b.get('opex', [0])) + np.array(cf_b.get('abex', [0]))) / dm))
+            total_rent = gi_pv - costs_pv
+
+            if total_rent <= 0:
+                st.error("El proyecto no genera renta económica positiva en estas condiciones. No es posible calcular el Government Take.")
+            else:
+                step = 1 if "Fina" in precision else (2 if "Media" in precision else 5)
+                r_range = np.arange(range_royalty[0], range_royalty[1] + 1, step)
+                i_range = np.arange(range_int_tax[0], range_int_tax[1] + 1, step)
+                s_range = np.arange(range_islr[0], range_islr[1] + 1, step)
+                
+                rows_gt = []
+                for r_val in r_range:
+                    for i_val in i_range:
+                        for s_val in s_range:
+                            v_roy = (r_val / 100.0) * gi_pv
+                            v_iih = (i_val / 100.0) * gi_pv
+                            taxable = gi_pv - v_roy - v_iih - costs_pv
+                            v_islr = (s_val / 100.0) * max(0.0, taxable)
+                            v_hpoc_pre = taxable
+                            v_hpoc_post = taxable - v_islr
+                            gt_c = ((v_roy + v_iih + v_islr) / total_rent) * 100.0
+                            if abs(gt_c - target_gt) <= tolerance:
+                                rows_gt.append({
+                                    "Regalía (%)": r_val,
+                                    "Imp. Integrado (%)": i_val,
+                                    "ISLR (%)": s_val,
+                                    "VPN HPOC Pre-Tax (MMUSD)": v_hpoc_pre,
+                                    "VPN HPOC Post-Tax (MMUSD)": v_hpoc_post,
+                                    "Government Take (%)": gt_c
+                                })
+                if rows_gt:
+                    st.session_state[gt_store_key] = pd.DataFrame(rows_gt).sort_values("VPN HPOC Post-Tax (MMUSD)", ascending=False)
+                else:
+                    st.session_state[gt_store_key] = None
+                    st.warning("No se encontraron combinaciones en el rango especificado. Intenta aumentar la tolerancia o ajustar el objetivo.")
+
+    if gt_store_key in st.session_state and st.session_state[gt_store_key] is not None:
+        df_gt_res = st.session_state[gt_store_key].copy()
+        total_found = len(df_gt_res)
+        
+        st.markdown("---")
+        st.subheader("📊 Dashboard de Optimización HPOC: VPN vs. Government Take")
+
+        tol_viz_key = f"m_tol_{sel_esc_name}"
+        if tol_viz_key not in st.session_state:
+            st.session_state[tol_viz_key] = 1.0
+        m_tol = st.session_state[tol_viz_key]
+
+        cat_cumple = f"Cumple Meta ({target_gt-0.5:.1f} - {target_gt+0.5:.1f}%)"
+        cat_prox = f"Proximidad Crítica ({target_gt-m_tol:.1f} - {target_gt-0.5:.1f}% y {target_gt+0.5:.1f} - {target_gt+m_tol:.1f}%)"
+
+        def _get_gt_cat(gt_val):
+            diff = abs(gt_val - target_gt)
+            if diff <= 0.5: return cat_cumple
+            elif diff <= m_tol: return cat_prox
+            else: return "Resto"
+
+        df_gt_res['Categoria'] = df_gt_res['Government Take (%)'].apply(_get_gt_cat)
+        df_viz = df_gt_res[df_gt_res['Categoria'] != "Resto"].copy()
+        
+        num_meta = len(df_viz[df_viz['Categoria'] == cat_cumple])
+        max_vpn_cumple = df_viz[df_viz['Categoria'] == cat_cumple]['VPN HPOC Post-Tax (MMUSD)'].max() if num_meta > 0 else 0
+        best_vpn_overall = df_gt_res['VPN HPOC Post-Tax (MMUSD)'].max() if len(df_gt_res) > 0 else 0
+
+        db_c1, db_c2, db_c3 = st.columns([1, 2, 1.1])
+        with db_c1:
+            st.markdown("<span style='font-size:11px; font-weight:bold; color:#94a3b8;'>ESCENARIOS EN META</span>", unsafe_allow_html=True)
+            st.markdown(f"<h2 style='margin-top:-6px; color:#0c1c3e;'>{num_meta} <span style='font-size:16px; font-weight:normal; color:#94a3b8;'>de {total_found}</span></h2>", unsafe_allow_html=True)
+            st.progress(num_meta / total_found if total_found > 0 else 0.0)
+            
+            st.slider("Margen de Tolerancia Visual (%)", min_value=1.0, max_value=10.0, step=0.5, key=tol_viz_key, help="Ajusta el rango para considerar escenarios en 'Proximidad Crítica'")
+            st.caption(f"Nota: {num_meta} escenarios cumplen la meta.")
+
+            st.markdown("<span style='font-size:11px; font-weight:bold; color:#94a3b8;'>MÁXIMO VPN (CUMPLE)</span>", unsafe_allow_html=True)
+            st.markdown(f"<h2 style='margin-top:-6px; color:#059669;'>${max_vpn_cumple:,.2f}M</h2>", unsafe_allow_html=True)
+            st.caption("Valor óptimo bajo restricción de GT")
+
+            st.markdown("<span style='font-size:11px; font-weight:bold; color:#94a3b8;'>MEJOR VPN ABSOLUTO</span>", unsafe_allow_html=True)
+            st.markdown(f"<h2 style='margin-top:-6px; color:#2563eb;'>${best_vpn_overall:,.2f}M</h2>", unsafe_allow_html=True)
+            st.caption("Independiente de la meta")
+
+        with db_c2:
+            if len(df_viz) > 0:
+                fig_gt = px.scatter(
+                    df_viz, 
+                    x="Government Take (%)", 
+                    y="VPN HPOC Post-Tax (MMUSD)",
+                    color="Categoria",
+                    color_discrete_map={cat_cumple: "#10b981", cat_prox: "#64748b"},
+                    hover_data=["Regalía (%)", "Imp. Integrado (%)", "ISLR (%)"],
+                    title="Análisis de Proximidad a la Meta"
+                )
+                fig_gt.add_vline(x=target_gt, line_dash="dash", line_color="#ef4444", annotation_text=f"META {target_gt}%")
+                fig_gt.update_traces(marker=dict(size=14, opacity=0.9, line=dict(width=1, color='white')))
+                fig_gt.update_layout(
+                    legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="left", x=0, title=""),
+                    margin=dict(b=80),
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(248,249,250,0.8)'
+                )
+                st.plotly_chart(fig_gt, use_container_width=True)
+            else:
+                st.info("No hay escenarios en el rango visual. Amplía la tolerancia en la búsqueda.")
+
+        with db_c3:
+            st.markdown("**Top Resultados (Visualizados)**")
+            with st.container(height=450):
+                if len(df_viz) == 0:
+                    st.caption("No hay escenarios para mostrar.")
+                else:
+                    sorted_viz = df_viz.sort_values("VPN HPOC Post-Tax (MMUSD)", ascending=False)
+                    for i, (_, row) in enumerate(sorted_viz.iterrows()):
+                        bg_c = "#ecfdf5" if row['Categoria'] == cat_cumple else "#f8fafc"
+                        bd_c = "#a7f3d0" if row['Categoria'] == cat_cumple else "#e2e8f0"
+                        st.markdown(f"""
+                        <div style='background-color: {bg_c}; border: 1px solid {bd_c}; border-radius: 12px; padding: 12px; margin-bottom: 10px;'>
+                            <div style='display: flex; justify-content: space-between; margin-bottom: 4px;'>
+                                <span style='font-size: 0.75rem; font-weight: bold; color: #64748b;'>RANK {i+1}</span>
+                                <span style='font-size: 0.75rem; font-weight: bold; background-color: #e2e8f0; padding: 2px 8px; border-radius: 10px;'>GT: {row['Government Take (%)']:.2f}%</span>
+                            </div>
+                            <div style='font-size: 1.35rem; font-weight: 900; color: #1e293b; margin: 3px 0;'>
+                                ${row['VPN HPOC Post-Tax (MMUSD)']:.2f} <span style='font-size: 0.7rem; font-weight: normal; color: #94a3b8;'>MMUSD</span>
+                            </div>
+                            <div style='display: flex; gap: 5px; margin-top: 6px;'>
+                                <span style='font-size: 0.7rem; background-color: rgba(255,255,255,0.8); border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px;'>R: {row['Regalía (%)']:.0f}%</span>
+                                <span style='font-size: 0.7rem; background-color: rgba(255,255,255,0.8); border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px;'>Ii: {row['Imp. Integrado (%)']:.0f}%</span>
+                                <span style='font-size: 0.7rem; background-color: rgba(255,255,255,0.8); border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px;'>I: {row['ISLR (%)']:.0f}%</span>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+        with st.expander("📂 Ver Tabla de Datos Completa", expanded=False):
+            st.dataframe(
+                df_gt_res.drop(columns=['Categoria'], errors='ignore').head(100).style.format({
+                    "Regalía (%)": "{:.0f}%",
+                    "Imp. Integrado (%)": "{:.0f}%",
+                    "ISLR (%)": "{:.0f}%",
+                    "VPN HPOC Pre-Tax (MMUSD)": "{:.2f}",
+                    "VPN HPOC Post-Tax (MMUSD)": "{:.2f}",
+                    "Government Take (%)": "{:.2f}%"
+                }).background_gradient(subset=["VPN HPOC Post-Tax (MMUSD)"], cmap="Greens"),
+                use_container_width=True
+            )
     else:
-        df_t8_raw = pd.DataFrame(sens_data_t8)
+        st.info("💡 Haz clic en 'Buscar Combinaciones Óptimas' para evaluar combinaciones fiscales bajo la meta de Government Take.")
 
-        def _norm_col(col):
-            if 'Precio' in col or 'Oil' in col:    return 'Oil Price'
-            if 'Regal' in col or 'Royalty' in col: return 'Royalty (%)'
-            if 'VPN HPOC Post' in col:             return 'NPV Post-Tax (MMUSD)'
-            if 'VPN HPOC Pre' in col:              return 'NPV Pre-Tax (MMUSD)'
-            if 'Gov Take' in col:                  return 'Gov Take (%)'
-            if 'IRR' in col:                       return 'IRR Post-Tax (%)'
-            if 'MCE' in col or 'Peak' in col:      return 'Peak Inv. (MCE) (MMUSD)'
-            if 'Payout' in col:                    return 'Payout (Years)'
-            if 'Max Financ' in col:                return 'Max Financing (MMUSD)'
-            if 'Break-even' in col or 'Punto' in col: return 'Break-even (USD/bbl)'
-            return col
 
-        df_t8_raw.columns = [_norm_col(c) for c in df_t8_raw.columns]
-        df_t8 = df_t8_raw.copy()
-        if 'Comp Take (%)' not in df_t8.columns:
-            df_t8['Comp Take (%)'] = 100 - df_t8['Gov Take (%)']
+# ─── TAB 9: ANÁLISIS DE SENSIBILIDAD FISCAL (MULTIDIMENSIONAL) ───────────────
+with t_sens_fiscal:
+    sens_data_t9 = sel_sc.get('sensibilidad', [])
+    if not sens_data_t9:
+        st.info("💡 No se encontraron datos de sensibilidad en este escenario.")
+    else:
+        df_t9 = pd.DataFrame(sens_data_t9)
+        def _norm_t9_col(c):
+            if 'Precio' in c or 'Oil' in c: return 'Precio Aceite'
+            if 'Regal' in c or 'Royalty' in c: return 'Regalía (%)'
+            if 'VPN HPOC Post' in c: return 'VPN HPOC Post (MMUSD)'
+            if 'VPN HPOC Pre' in c: return 'VPN HPOC Pre (MMUSD)'
+            if 'Gov Take' in c: return 'Gov Take (%)'
+            if 'MCE' in c or 'Peak' in c: return 'MCE (MMUSD)'
+            if 'Payout' in c: return 'Payout (Years)'
+            if 'Max Financ' in c: return 'Max Financ. (MMUSD)'
+            if 'Break-even' in c or 'Punto' in c: return 'Break-even (USD/bbl)'
+            if 'TIRM' in c or 'IRR' in c: return 'TIRM Post-Tax (%)'
+            return c
+        df_t9.columns = [_norm_t9_col(c) for c in df_t9.columns]
+        df_t9 = _ensure_sens_pre_tax(df_t9, sel_sc)
+        if 'Comp Take (%)' not in df_t9.columns:
+            df_t9['Comp Take (%)'] = 100.0 - df_t9['Gov Take (%)']
 
-        # ── Indicator Selector ────────────────────────────────────────────────
-        indicators_map_t8 = {
-            "NPV":        "NPV Post-Tax (MMUSD)",
-            "IRR":        "IRR Post-Tax (%)",
-            "GOV. TAKE":  "Gov Take (%)",
+        st.markdown("""
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; border-bottom: 3px solid #0c1c3e; padding-bottom: 10px;">
+            <div>
+                <h1 style="margin:0; font-family: 'Inter', sans-serif; color: #0c1c3e; font-size: 1.8rem; font-weight:800;">ANÁLISIS DE SENSIBILIDAD FISCAL</h1>
+                <p style="color: #64748b; margin-top: 4px; font-size: 0.95rem;">Evaluación Multidimensional: Precio vs. Regalías — Powered by STORM-Viewer</p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        ind_map_t9 = {
+            "VPN": "VPN HPOC Post (MMUSD)",
+            "TIR": "TIRM Post-Tax (%)" if 'TIRM Post-Tax (%)' in df_t9.columns else "VPN HPOC Post (MMUSD)",
+            "GOV. TAKE": "Gov Take (%)",
             "COMP. TAKE": "Comp Take (%)",
-            "PAYBACK":    "Payout (Years)",
-            "BREAK-EVEN": "Break-even (USD/bbl)"
+            "PAYBACK": "Payout (Years)",
+            "MARGEN UN.": "Break-even (USD/bbl)"
         }
-        available_inds = {k: v for k, v in indicators_map_t8.items() if v in df_t8.columns}
+        avail_inds = {k: v for k, v in ind_map_t9.items() if v in df_t9.columns and df_t9[v].notnull().any()}
+        
+        hdr_c1, hdr_c2 = st.columns([1, 1.2])
+        with hdr_c2:
+            active_ind_t9 = st.segmented_control(
+                "Seleccionar Indicador", 
+                options=list(avail_inds.keys()), 
+                default=list(avail_inds.keys())[0], 
+                label_visibility="collapsed",
+                key=f"t9_ind_ctrl_{sel_esc_name}"
+            ) or list(avail_inds.keys())[0]
+        active_col_t9 = avail_inds[active_ind_t9]
 
-        _hdr1, _hdr2 = st.columns([1, 1.2])
-        with _hdr2:
-            if available_inds:
-                active_ind_t8 = st.segmented_control(
-                    "Select Indicator",
-                    options=list(available_inds.keys()),
-                    default=list(available_inds.keys())[0],
-                    label_visibility="collapsed",
-                    key="t8_ind_ctrl"
-                ) or list(available_inds.keys())[0]
+        col_side, col_curve, col_radar = st.columns([1, 2.2, 1.2])
+        prices_t9 = sorted(df_t9['Precio Aceite'].unique())
+        royalties_t9 = sorted(df_t9['Regalía (%)'].unique())
+
+        with col_side:
+            st.markdown("#### ⚙️ PARÁMETROS DE ENTRADA")
+            mode_t9 = st.radio("Modo de Sensibilidad", ["Fijar Precio / Variar Regalía", "Fijar Regalía / Variar Precio"], key=f"t9_mode_{sel_esc_name}")
+            
+            if mode_t9 == "Fijar Precio / Variar Regalía":
+                fixed_p = st.selectbox("Precio Crudo (USD/bl)", options=prices_t9, format_func=lambda x: f"${x:.1f}", key=f"t9_p_{sel_esc_name}")
+                df_plot_t9 = df_t9[df_t9['Precio Aceite'] == fixed_p].sort_values('Regalía (%)')
+                x_axis_t9 = 'Regalía (%)'
+                x_lbl_t9 = "Regalía (%)"
+                sel_pt_val = st.select_slider("Seleccionar Punto (%)", options=sorted(df_plot_t9[x_axis_t9].unique()), value=sorted(df_plot_t9[x_axis_t9].unique())[0], key=f"t9_pt_{sel_esc_name}")
             else:
-                st.warning("No indicators available for this chart.")
-                active_ind_t8 = None
+                fixed_r = st.selectbox("Regalía (%)", options=royalties_t9, format_func=lambda x: f"{x:.0f}%", key=f"t9_r_{sel_esc_name}")
+                df_plot_t9 = df_t9[df_t9['Regalía (%)'] == fixed_r].sort_values('Precio Aceite')
+                x_axis_t9 = 'Precio Aceite'
+                x_lbl_t9 = "Precio Aceite (USD/bbl)"
+                sel_pt_val = st.select_slider("Seleccionar Punto (USD)", options=sorted(df_plot_t9[x_axis_t9].unique()), value=sorted(df_plot_t9[x_axis_t9].unique())[0], key=f"t9_pt_{sel_esc_name}")
 
-        active_col_t8 = available_inds[active_ind_t8]
+            pt_data = df_plot_t9[df_plot_t9[x_axis_t9] == sel_pt_val].iloc[0]
+            _vpn_card = f"${pt_data['VPN HPOC Post (MMUSD)']:,.1f}M"
+            _tir_card = f"{pt_data['TIRM Post-Tax (%)']:.1f}%" if 'TIRM Post-Tax (%)' in pt_data and pd.notnull(pt_data['TIRM Post-Tax (%)']) else "N/A"
+            _gt_card  = f"{pt_data['Gov Take (%)']:.1f}%"
+            _pb_card  = f"{pt_data['Payout (Years)']:.2f} Años" if 'Payout (Years)' in pt_data and pd.notnull(pt_data['Payout (Years)']) else "—"
 
-        col_side_t8, col_curve_t8, col_radar_t8 = st.columns([1, 2.2, 1.2])
+            st.markdown(f"""
+            <div style="background-color:#0c1c3e; color:white; padding:22px; border-radius:18px; box-shadow:0 8px 24px rgba(0,0,0,0.15); font-family:Inter,sans-serif; margin-top:15px;">
+                <p style="font-size:0.75rem; font-weight:700; color:#a0aec0; text-transform:uppercase; margin:0 0 4px 0; letter-spacing:1px;">INDICADORES CLAVE</p>
+                <p style="font-size:2rem; font-weight:900; margin:0 0 14px 0;">{_vpn_card}</p>
+                <table style="width:100%; border-collapse:collapse;">
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.12);">
+                        <td style="padding:8px 0; color:#94a3b8; font-size:0.85rem;">VPN Post-Tax</td>
+                        <td style="padding:8px 0; text-align:right; font-weight:700; font-size:0.95rem;">{_vpn_card}</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.12);">
+                        <td style="padding:8px 0; color:#94a3b8; font-size:0.85rem;">TIR</td>
+                        <td style="padding:8px 0; text-align:right; font-weight:700; color:#4ade80;">{_tir_card}</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid rgba(255,255,255,0.12);">
+                        <td style="padding:8px 0; color:#94a3b8; font-size:0.85rem;">Gov. Take</td>
+                        <td style="padding:8px 0; text-align:right; font-weight:700; color:#fbbf24;">{_gt_card}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 0; color:#94a3b8; font-size:0.85rem;">Payback</td>
+                        <td style="padding:8px 0; text-align:right; font-weight:700;">{_pb_card}</td>
+                    </tr>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
 
-        prices_t8    = sorted(df_t8['Oil Price'].unique())
-        royalties_t8 = sorted(df_t8['Royalty (%)'].unique())
-
-        with col_side_t8:
-            st.markdown("#### ⚙️ INPUT PARAMETERS")
-            mode_t8 = st.radio(
-                "Sensitivity Mode",
-                ["Fix Price / Vary Royalty", "Fix Royalty / Vary Price"],
-                key="t8_mode"
-            )
-
-            if mode_t8 == "Fix Price / Vary Royalty":
-                fixed_price_t8 = st.selectbox(
-                    "Crude Price (USD/bbl)", options=prices_t8,
-                    format_func=lambda x: f"${x:.1f}", key="t8_price"
-                )
-                df_curve = df_t8[df_t8['Oil Price'] == fixed_price_t8].sort_values('Royalty (%)')
-                x_col_t8 = 'Royalty (%)'
-                x_lbl_t8 = "Royalty (%)"
-            else:
-                fixed_roy_t8 = st.selectbox(
-                    "Royalty Rate (%)", options=royalties_t8,
-                    format_func=lambda x: f"{x:.0f}%", key="t8_royalty"
-                )
-                df_curve = df_t8[df_t8['Royalty (%)'] == fixed_roy_t8].sort_values('Oil Price')
-                x_col_t8 = 'Oil Price'
-                x_lbl_t8 = "Oil Price (USD/bbl)"
-
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            x_opts = sorted(df_curve[x_col_t8].unique())
-            if mode_t8 == "Fix Price / Vary Royalty":
-                sel_pt = st.select_slider("Selected Point (%)", options=x_opts, value=x_opts[0], key="t8_pt")
-            else:
-                sel_pt = st.select_slider("Selected Point (USD)", options=x_opts, value=x_opts[0], key="t8_pt")
-
-            pt = df_curve[df_curve[x_col_t8] == sel_pt].iloc[0]
-
-            _vpn = f"${pt['NPV Post-Tax (MMUSD)']:,.1f}M"
-            _irr = f"{pt['IRR Post-Tax (%)']:.1f}%" if 'IRR Post-Tax (%)' in pt else "—"
-            _gt  = f"{pt['Gov Take (%)']:.1f}%"
-            _pb  = f"{pt['Payout (Years)']:.2f} yrs" if 'Payout (Years)' in pt else "—"
-
-            kpi_html = (
-                '<div style="background-color:#0c1c3e;color:white;padding:22px;border-radius:18px;'
-                'box-shadow:0 8px 24px rgba(0,0,0,0.15);font-family:Segoe UI,sans-serif;">'
-                '<p style="font-size:0.75rem;font-weight:700;color:#a0aec0;text-transform:uppercase;'
-                'margin:0 0 4px 0;letter-spacing:1px;">KEY INDICATORS</p>'
-                '<p style="font-size:2rem;font-weight:900;margin:0 0 14px 0;">' + _vpn + '</p>'
-                '<table style="width:100%;border-collapse:collapse;">'
-                '<tr style="border-bottom:1px solid rgba(255,255,255,0.12);">'
-                '<td style="padding:9px 0;color:#94a3b8;font-size:0.85rem;">NPV Post-Tax</td>'
-                '<td style="padding:9px 0;text-align:right;font-weight:700;font-size:1rem;">' + _vpn + '</td>'
-                '</tr>'
-                '<tr style="border-bottom:1px solid rgba(255,255,255,0.12);">'
-                '<td style="padding:9px 0;color:#94a3b8;font-size:0.85rem;">IRR</td>'
-                '<td style="padding:9px 0;text-align:right;font-weight:700;color:#4ade80;">' + _irr + '</td>'
-                '</tr>'
-                '<tr style="border-bottom:1px solid rgba(255,255,255,0.12);">'
-                '<td style="padding:9px 0;color:#94a3b8;font-size:0.85rem;">Gov. Take</td>'
-                '<td style="padding:9px 0;text-align:right;font-weight:700;color:#fbbf24;">' + _gt + '</td>'
-                '</tr>'
-                '<tr>'
-                '<td style="padding:9px 0;color:#94a3b8;font-size:0.85rem;">Payback</td>'
-                '<td style="padding:9px 0;text-align:right;font-weight:700;">' + _pb + '</td>'
-                '</tr>'
-                '</table>'
-                '</div>'
-            )
-            st.markdown(kpi_html, unsafe_allow_html=True)
-
-        with col_curve_t8:
+        with col_curve:
             fig_curve = go.Figure()
             fig_curve.add_trace(go.Scatter(
-                x=df_curve[x_col_t8],
-                y=df_curve[active_col_t8],
+                x=df_plot_t9[x_axis_t9],
+                y=df_plot_t9[active_col_t9],
                 mode='lines+markers',
                 line=dict(color='#6366f1', width=4),
-                marker=dict(size=11, color='white', line=dict(color='#6366f1', width=3)),
+                marker=dict(size=10, color='white', line=dict(color='#6366f1', width=3)),
                 fill='tozeroy',
                 fillcolor='rgba(99,102,241,0.06)',
-                hovertemplate=f"<b>{x_lbl_t8}:</b> %{{x}}<br><b>{active_ind_t8}:</b> %{{y:.2f}}<extra></extra>"
+                hovertemplate=f"<b>{x_lbl_t9}:</b> %{{x}}<br><b>{active_ind_t9}:</b> %{{y:.2f}}<extra></extra>"
             ))
             fig_curve.add_trace(go.Scatter(
-                x=[sel_pt], y=[pt[active_col_t8]],
+                x=[sel_pt_val], y=[pt_data[active_col_t9]],
                 mode='markers',
-                marker=dict(size=18, color='#6366f1', line=dict(color='white', width=3)),
+                marker=dict(size=16, color='#6366f1', line=dict(color='white', width=3)),
                 showlegend=False,
-                hovertemplate=f"<b>Selected</b><br>{x_lbl_t8}: {sel_pt}<br>{active_ind_t8}: {pt[active_col_t8]:.2f}<extra></extra>"
+                hovertemplate=f"<b>Punto Seleccionado</b><br>{x_lbl_t9}: {sel_pt_val}<br>{active_ind_t9}: {pt_data[active_col_t9]:.2f}<extra></extra>"
             ))
             fig_curve.update_layout(
-                title=dict(text=f"Curve: {active_ind_t8}", font=dict(size=14, color='#0c1c3e'), x=0),
-                xaxis_title=x_lbl_t8, yaxis_title=active_ind_t8,
+                title=dict(text=f"Curva: {active_ind_t9}", font=dict(size=15, color='#0c1c3e'), x=0),
+                xaxis_title=x_lbl_t9, yaxis_title=active_ind_t9,
                 paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                margin=dict(t=50, b=50, l=50, r=20), height=480,
+                margin=dict(t=50, b=50, l=50, r=20), height=460,
                 xaxis=dict(showgrid=True, gridcolor='#f1f5f9', zeroline=False),
                 yaxis=dict(showgrid=True, gridcolor='#f1f5f9', zeroline=False),
-                font=dict(family='Segoe UI, sans-serif')
+                font=dict(family='Inter, sans-serif')
             )
             st.plotly_chart(fig_curve, use_container_width=True)
 
-        with col_radar_t8:
-            st.markdown("#### PROJECT BALANCE")
-            v_vpn_r = pt['NPV Post-Tax (MMUSD)']
-            v_tir_r = pt.get('IRR Post-Tax (%)', 0)
-            v_gt_r  = pt['Gov Take (%)']
-            v_ct_r  = 100 - v_gt_r
-            v_pb_r  = pt.get('Payout (Years)', 7.5)
-            v_mg_r  = pt.get('Break-even (USD/bbl)', 50)
+        with col_radar:
+            st.markdown("#### BALANCE DEL PROYECTO")
+            v_vpn_r = float(pt_data['VPN HPOC Post (MMUSD)'])
+            v_tir_r = float(pt_data.get('TIRM Post-Tax (%)', 15.0)) if pd.notnull(pt_data.get('TIRM Post-Tax (%)')) else 15.0
+            v_gt_r  = float(pt_data['Gov Take (%)'])
+            v_ct_r  = 100.0 - v_gt_r
+            v_pb_r  = float(pt_data.get('Payout (Years)', 7.5)) if pd.notnull(pt_data.get('Payout (Years)')) else 7.5
+            v_mg_r  = float(pt_data.get('Break-even (USD/bbl)', 50.0)) if pd.notnull(pt_data.get('Break-even (USD/bbl)')) else 50.0
 
             r_vals = [
-                min(1.0, max(0, v_vpn_r / 500)),
-                min(1.0, max(0, v_tir_r / 100)),
-                v_gt_r / 100, v_ct_r / 100,
-                max(0.05, 1 - (v_pb_r / 15)),
-                max(0.05, 1 - (v_mg_r / 100))
+                min(1.0, max(0.0, v_vpn_r / 500.0)),
+                min(1.0, max(0.0, v_tir_r / 100.0)),
+                v_gt_r / 100.0,
+                v_ct_r / 100.0,
+                max(0.05, 1.0 - (v_pb_r / 15.0)),
+                max(0.05, 1.0 - (v_mg_r / 100.0))
             ]
 
-            fig_radar_t8 = go.Figure()
-            fig_radar_t8.add_trace(go.Scatterpolar(
+            fig_radar_t9 = go.Figure()
+            fig_radar_t9.add_trace(go.Scatterpolar(
                 r=r_vals,
-                theta=["NPV", "IRR", "Gov Take", "Comp Take", "Payback", "Break-even"],
+                theta=["VPN", "TIR", "Gov Take", "Comp Take", "Payback", "Break-even"],
                 fill='toself',
                 fillcolor='rgba(99,102,241,0.25)',
                 line=dict(color='#6366f1', width=2),
-                marker=dict(size=7, color='#6366f1')
+                marker=dict(size=6, color='#6366f1')
             ))
-            fig_radar_t8.update_layout(
-                polar=dict(
-                    radialaxis=dict(visible=False, range=[0, 1]),
-                    angularaxis=dict(tickfont=dict(size=10, color='#64748b'))
-                ),
+            fig_radar_t9.update_layout(
+                polar=dict(radialaxis=dict(visible=False, range=[0, 1]), angularaxis=dict(tickfont=dict(size=10, color='#64748b'))),
                 showlegend=False, paper_bgcolor='rgba(0,0,0,0)',
-                margin=dict(t=30, b=30, l=30, r=30), height=320,
-                font=dict(family='Segoe UI, sans-serif', size=10, color='#64748b')
+                margin=dict(t=25, b=25, l=25, r=25), height=310,
+                font=dict(family='Inter, sans-serif', size=10, color='#64748b')
             )
-            st.plotly_chart(fig_radar_t8, use_container_width=True)
+            st.plotly_chart(fig_radar_t9, use_container_width=True)
 
-            obs_price = pt.get('Oil Price', '—')
-            obs_roy   = pt.get('Royalty (%)', '—')
-            st.markdown(
-                f'<div style="background:#f8fafc;border-radius:12px;padding:16px;border-left:4px solid #6366f1;margin-top:8px;">'
-                f'<div style="font-size:0.72rem;font-weight:700;color:#64748b;margin-bottom:5px;">ℹ️ NOTE</div>'
-                f'<div style="font-size:0.88rem;color:#1e293b;">At <b>${obs_price:.1f}/bbl</b>, '
-                f'the optimal fiscal balance is found at a royalty rate of <b>{obs_roy:.0f}%</b>.</div>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
+            obs_p = pt_data.get('Precio Aceite', 60.0)
+            obs_r = pt_data.get('Regalía (%)', 30.0)
+            st.markdown(f"""
+            <div style="background:#f8fafc; border-radius:12px; padding:14px; border-left:4px solid #6366f1; margin-top:8px;">
+                <div style="font-size:0.72rem; font-weight:700; color:#64748b; margin-bottom:4px;">ℹ️ NOTA</div>
+                <div style="font-size:0.85rem; color:#1e293b;">A <b>${obs_p:.1f}/bl</b>, el balance fiscal óptimo se encuentra con una regalía de <b>{obs_r:.0f}%</b>.</div>
+            </div>
+            """, unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        c_rent_t8, c_heat_t8 = st.columns([1, 1])
+        c_rent_t9, c_heat_t9 = st.columns([1, 1])
 
-        with c_rent_t8:
-            st.markdown("#### 💰 RENT DISTRIBUTION")
-            st.caption("Relative share of total generated economic rent")
-            v_gt_bar = pt['Gov Take (%)']
-            v_ct_bar = 100 - v_gt_bar
-            fig_rent_t8 = go.Figure()
-            fig_rent_t8.add_trace(go.Bar(y=["Distribution"], x=[v_gt_bar], name="State",    orientation='h', marker=dict(color='#f59e0b')))
-            fig_rent_t8.add_trace(go.Bar(y=["Distribution"], x=[v_ct_bar], name="Contractor", orientation='h', marker=dict(color='#6366f1')))
-            fig_rent_t8.update_layout(
+        with c_rent_t9:
+            st.markdown("#### 💰 DISTRIBUCIÓN DE RENTA")
+            st.caption("Participación relativa de la renta económica total generada")
+            v_gt_bar = float(pt_data['Gov Take (%)'])
+            v_ct_bar = 100.0 - v_gt_bar
+            fig_rent_t9 = go.Figure()
+            fig_rent_t9.add_trace(go.Bar(y=["Distribución"], x=[v_gt_bar], name="Estado", orientation='h', marker=dict(color='#f59e0b')))
+            fig_rent_t9.add_trace(go.Bar(y=["Distribución"], x=[v_ct_bar], name="Contratista", orientation='h', marker=dict(color='#6366f1')))
+            fig_rent_t9.update_layout(
                 barmode='stack',
                 xaxis=dict(showticklabels=False, range=[0, 100]),
                 yaxis=dict(showticklabels=False), showlegend=True,
@@ -1312,160 +1751,230 @@ with t_det6b:
                 paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
                 margin=dict(t=40, b=20, l=20, r=20), height=180
             )
-            fig_rent_t8.add_annotation(x=v_gt_bar/2,            y=0, text=f"State<br>{v_gt_bar:.1f}%",      showarrow=False, font=dict(color="white", size=13, weight="bold"))
-            fig_rent_t8.add_annotation(x=v_gt_bar+v_ct_bar/2,   y=0, text=f"Contractor<br>{v_ct_bar:.1f}%", showarrow=False, font=dict(color="white", size=13, weight="bold"))
-            st.plotly_chart(fig_rent_t8, use_container_width=True)
+            fig_rent_t9.add_annotation(x=v_gt_bar/2, y=0, text=f"Estado<br>{v_gt_bar:.1f}%", showarrow=False, font=dict(color="white", size=13, weight="bold"))
+            fig_rent_t9.add_annotation(x=v_gt_bar+v_ct_bar/2, y=0, text=f"Contratista<br>{v_ct_bar:.1f}%", showarrow=False, font=dict(color="white", size=13, weight="bold"))
+            st.plotly_chart(fig_rent_t9, use_container_width=True)
 
-        with c_heat_t8:
-            st.markdown("#### 🌡️ NPV INTENSITY MAP")
-            st.caption("Full sensitivity overview — Royalty vs. Oil Price")
+        with c_heat_t9:
+            st.markdown("#### 🌡️ MAPA DE INTENSIDAD VPN")
+            st.caption("Evaluación global de sensibilidad — Regalía vs. Precio")
             try:
-                pivot_heat_t8 = df_t8.pivot(index='Royalty (%)', columns='Oil Price', values='NPV Post-Tax (MMUSD)')
-                fig_heat_t8 = px.imshow(
-                    pivot_heat_t8,
-                    labels=dict(x="Oil Price (USD/bbl)", y="Royalty (%)", color="NPV (MMUSD)"),
+                pivot_heat_t9 = df_t9.pivot(index='Regalía (%)', columns='Precio Aceite', values='VPN HPOC Post (MMUSD)')
+                fig_heat_t9 = px.imshow(
+                    pivot_heat_t9,
+                    labels=dict(x="Precio Aceite (USD/bbl)", y="Regalía (%)", color="VPN (MMUSD)"),
                     color_continuous_scale='Blues', aspect='auto'
                 )
-                fig_heat_t8.update_layout(margin=dict(t=10, b=40, l=10, r=10), height=200,
-                                          coloraxis_showscale=True, coloraxis_colorbar=dict(thickness=12, len=0.8))
-                st.plotly_chart(fig_heat_t8, use_container_width=True)
+                fig_heat_t9.update_layout(margin=dict(t=10, b=40, l=10, r=10), height=200, coloraxis_colorbar=dict(thickness=12, len=0.8))
+                st.plotly_chart(fig_heat_t9, use_container_width=True)
             except Exception:
-                st.info("Heatmap requires a full price × royalty grid in the sensitivity data.")
+                st.info("El mapa de calor requiere una matriz completa de precio × regalía.")
 
-with t_det7:
-    st.subheader("Fiscal Equilibrium Sensitivity (Government Take)")
-    st.markdown("Optimization of fiscal terms (Royalty, Integrated Tax, and Income Tax) to balance Government Take vs. Investor Profitability.")
-    
-    gt_data = sel_sc.get('optimizacion_fiscal', [])
-    if gt_data:
-        df_gt_res = pd.DataFrame(gt_data)
-        
-        # Ensure columns are in English and handle any encoding issues
-        if len(df_gt_res.columns) >= 6:
-            df_gt_res.columns = [
-                'Royalty (%)', 'Integrated Tax (%)', 'Income Tax (ISLR) (%)', 
-                'NPV Pre-Tax (MMUSD)', 'NPV Post-Tax (MMUSD)', 'Government Take (%)'
-            ][:len(df_gt_res.columns)]
-        
-        # Read Target GT from JSON (params or root)
-        target_gt = sel_sc['params'].get('target_gt')
-        if target_gt is None: 
-            target_gt = sel_sc.get('target_gt', 50.0) # Fallback to 50.0 if missing
-        
-        st.markdown("---")
-        st.subheader("📊 HPOC Optimization Dashboard: NPV vs. Government Take")
-        
-        total_found = len(df_gt_res)
-        
-        # Visual Tolerance Margin (Sync with Visualizer style)
-        if 'viewer_margen_tol' not in st.session_state:
-            st.session_state['viewer_margen_tol'] = 1.0
-            
-        m_tol = st.session_state['viewer_margen_tol']
-        
-        # English Categories
-        cat_cumple = f"Meets Target ({target_gt-0.5:.1f} - {target_gt+0.5:.1f}%)"
-        cat_prox = f"Critical Proximity ({target_gt-m_tol:.1f} - {target_gt-0.5:.1f}% and {target_gt+0.5:.1f} - {target_gt+m_tol:.1f}%)"
-        
-        def get_cat(gt):
-            diff = abs(gt - target_gt)
-            if diff <= 0.5: return cat_cumple
-            elif diff <= m_tol: return cat_prox
-            else: return "Other"
-            
-        df_gt_res['Category'] = df_gt_res['Government Take (%)'].apply(get_cat)
-        df_viz = df_gt_res[df_gt_res['Category'] != "Other"].copy()
-        
-        num_meta = len(df_viz[df_viz['Category'] == cat_cumple])
-        max_vpn_cumple = df_viz[df_viz['Category'] == cat_cumple]['NPV Post-Tax (MMUSD)'].max() if num_meta > 0 else 0
-        best_vpn_overall = df_gt_res['NPV Post-Tax (MMUSD)'].max() if len(df_gt_res) > 0 else 0
-        
-        db_c1, db_c2, db_c3 = st.columns([1, 2, 1])
-        
-        with db_c1:
-            st.markdown("<span style='font-size:10px; font-weight:bold; color:#94a3b8;'>SCENARIOS IN TARGET</span>", unsafe_allow_html=True)
-            st.markdown(f"<h2 style='margin-top:-10px;'>{num_meta} <span style='font-size:16px; font-weight:normal; color:#94a3b8;'>of {total_found}</span></h2>", unsafe_allow_html=True)
-            st.progress(num_meta / total_found if total_found > 0 else 0)
-            
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.slider("Visual Tolerance Margin (%)", min_value=1.0, max_value=10.0, step=0.5, key="viewer_margen_tol")
-            st.caption(f"Note: {num_meta} scenarios meet the target.")
-            
-            st.markdown("<br><span style='font-size:10px; font-weight:bold; color:#94a3b8;'>MAX NPV (MEETS TARGET)</span>", unsafe_allow_html=True)
-            st.markdown(f"<h2 style='margin-top:-10px; color:#059669;'>${max_vpn_cumple:,.2f}M</h2>", unsafe_allow_html=True)
-            st.caption("✅ Optimal value under constraint")
-            
-            st.markdown("<br><span style='font-size:10px; font-weight:bold; color:#94a3b8;'>BEST ABSOLUTE NPV</span>", unsafe_allow_html=True)
-            st.markdown(f"<h2 style='margin-top:-10px; color:#2563eb;'>${best_vpn_overall:,.2f}M</h2>", unsafe_allow_html=True)
-            st.caption("📈 Independent of target")
-            
-        with db_c2:
-            if len(df_viz) > 0:
-                fig = px.scatter(df_viz, 
-                                 x="Government Take (%)", 
-                                 y="NPV Post-Tax (MMUSD)",
-                                 color="Category",
-                                 color_discrete_map={cat_cumple: "#10b981", cat_prox: "#64748b"},
-                                 hover_data=["Royalty (%)", "Integrated Tax (%)", "Income Tax (ISLR) (%)"],
-                                 title="Goal Proximity Analysis")
-                fig.add_vline(x=target_gt, line_dash="dash", line_color="#ef4444", annotation_text=f"TARGET {target_gt}%")
-                fig.update_traces(marker=dict(size=14, opacity=0.9, line=dict(width=1, color='white')))
-                
-                fig.update_xaxes(title_text="")
-                fig.add_annotation(
-                    x=1, y=-0.12, xref='paper', yref='paper',
-                    xanchor='right', yanchor='top',
-                    text="Government Take (%)", showarrow=False,
-                    font=dict(size=12, color="#64748b")
-                )
-                fig.update_layout(
-                    legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="left", x=0, title=""),
-                    margin=dict(b=80)
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No scenarios found within the visual range. Increase the tolerance margin.")
-                
-        with db_c3:
-            st.markdown(f"**Top Ranked Results**")
-            with st.container(height=450):
-                if len(df_viz) == 0:
-                    st.caption("No scenarios to display.")
-                else:
-                    sorted_viz = df_viz.sort_values("NPV Post-Tax (MMUSD)", ascending=False)
-                    for i, (idx, row) in enumerate(sorted_viz.iterrows()):
-                        color = "#10b981" if row['Category'] == cat_cumple else "#64748b"
-                        bg_color = "#ecfdf5" if row['Category'] == cat_cumple else "#f8fafc"
-                        st.markdown(f"""
-                        <div style="padding:12px; border-radius:12px; background:{bg_color}; border: 1px solid {color}44; margin-bottom:10px;">
-                            <div style='display: flex; justify-content: space-between;'>
-                                <span style="font-size:10px; font-weight:bold; color:#64748b;">RANK {i+1}</span>
-                                <span style='font-size: 10px; font-weight: bold; background: #e2e8f0; padding: 2px 8px; border-radius: 10px;'>GT: {row['Government Take (%)']:.2f}%</span>
-                            </div>
-                            <div style="font-size:1.4rem; font-weight:900; color:#1e293b; margin:5px 0;">${row['NPV Post-Tax (MMUSD)']:.2f} <span style='font-size:0.7rem; color:#94a3b8;'>MMUSD</span></div>
-                            <div style='display: flex; gap: 5px; margin-top: 5px;'>
-                                <span style='font-size: 0.7rem; background: white; border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px;'>R: {row['Royalty (%)']:.0f}%</span>
-                                <span style='font-size: 0.7rem; background: white; border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px;'>Ii: {row['Integrated Tax (%)']:.0f}%</span>
-                                <span style='font-size: 0.7rem; background: white; border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px;'>I: {row['Income Tax (ISLR) (%)']:.0f}%</span>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-        
-        with st.expander("📂 View Full Optimization Data Table", expanded=False):
-            st.dataframe(
-                df_gt_res.drop(columns=['Category']).style.format({
-                    "Royalty (%)": "{:.0f}",
-                    "Integrated Tax (%)": "{:.0f}",
-                    "Income Tax (ISLR) (%)": "{:.0f}",
-                    "NPV Pre-Tax (MMUSD)": "{:.2f}",
-                    "NPV Post-Tax (MMUSD)": "{:.2f}",
-                    "Government Take (%)": "{:.2f}"
-                }).background_gradient(subset=["NPV Post-Tax (MMUSD)"], cmap="Greens"),
-                use_container_width=True
-            )
-            
+
+# ─── TAB 10: CAJA AUTOFINANCIABLE & EXPOSICIÓN ───────────────────────────────
+with t_autofin:
+    st.header("📦 Modelo de Caja Autofinanciable y Métricas de Exposición (MCO / TIRM)")
+    st.markdown(
+        "Este análisis evalúa el desempeño financiero del proyecto asumiendo que el "
+        "Contratista dispone de un **Capital Inicial** ($C_0$) para cubrir los egresos planificados y "
+        "asegurar las operaciones, de modo que el proyecto posteriormente se **autofinancia** "
+        "a partir de los ingresos generados por la venta de los hidrocarburos."
+    )
+
+    autofin_cases, cap_cases = _get_autofin_cases(sel_sc)
+
+    if not autofin_cases:
+        st.info("💡 Este escenario no contiene datos de flujo de caja post-impuesto suficientes para simular la caja autofinanciable.")
     else:
-        st.warning("⚠️ No Fiscal Optimization data found in this scenario file.")
+        case_options = [
+            f"Caso 1: {cap_cases[0]:.1f} MMUSD",
+            f"Caso 2 (Base): {cap_cases[1]:.1f} MMUSD",
+            f"Caso 3: {cap_cases[2]:.1f} MMUSD"
+        ]
+        
+        selected_case_lbl = st.segmented_control(
+            "Seleccionar Caso de Inversión Inicial:",
+            options=case_options,
+            default=case_options[1],
+            key=f"sel_cap_case_{sel_esc_name}"
+        ) or case_options[1]
+        
+        case_idx = case_options.index(selected_case_lbl)
+        case_key = f"caso_{case_idx + 1}"
+        case_data = autofin_cases[case_key]
+        cap_selected = float(case_data['capital'])
+
+        mco_val = float(np.mean(case_data['mco_autofin']))
+        min_pool_val = float(np.mean(case_data['min_pool_months']))
+        payback_val = float(np.mean(case_data['payback_months_autofin']))
+        tirm_inv = case_data['tirm_investor']
+        moic_inv = float(np.mean(case_data['moic_investor']))
+        npv_inv = float(np.mean(case_data['npv_investor']))
+
+        st.markdown(f"### 📊 Indicadores Clave del Inversionista — Caso Evaluado: {cap_selected:.1f} MMUSD")
+        
+        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+        card_autofin_tpl = """
+        <div style="background: white; padding: 22px; border-radius: 12px; box-shadow: 0 4px 18px rgba(0,0,0,0.06); border-top: 4px solid {color}; text-align: center; height: 100%;">
+            <div style="color: #718096; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; margin-bottom: 8px;">{title}</div>
+            <div style="color: #2d3748; font-size: 1.8rem; font-weight: 800; margin-bottom: 4px;">{value}</div>
+            <div style="color: #a0aec0; font-size: 0.72rem; font-style: italic;">{subtitle}</div>
+        </div>
+        """
+        with col_k1:
+            st.markdown(card_autofin_tpl.format(title="Capital Inicial (C₀)", value=f"{cap_selected:.1f} MMUSD", subtitle="Capital aportado al inicio", color="#4a5568"), unsafe_allow_html=True)
+        with col_k2:
+            st.markdown(card_autofin_tpl.format(title="Exposición Máxima (MCO)", value=f"{mco_val:.2f} MMUSD", subtitle="Financiamiento total requerido", color="#dc2626"), unsafe_allow_html=True)
+        with col_k3:
+            st.markdown(card_autofin_tpl.format(title="Mes de Mínima Caja", value=f"Mes {int(round(min_pool_val)) + 1}", subtitle="Punto más bajo del balance", color="#d97706"), unsafe_allow_html=True)
+        with col_k4:
+            pb_str = f"Mes {int(round(payback_val))}" if payback_val < len(dates) else "N/A"
+            st.markdown(card_autofin_tpl.format(title="Mes Autofinanciamiento", value=pb_str, subtitle="Recuperación total de inversión", color="#16a34a"), unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_k5, col_k6, col_k7 = st.columns(3)
+        with col_k5:
+            tirm_str_inv = f"{tirm_inv:.2f}%" if tirm_inv is not None and np.isfinite(tirm_inv) else "N/A"
+            st.markdown(card_autofin_tpl.format(title="TIRM del Inversionista", value=tirm_str_inv, subtitle="Tasa Interna Retorno Modificada", color="#00d4ff"), unsafe_allow_html=True)
+        with col_k6:
+            st.markdown(card_autofin_tpl.format(title="MOIC Inversionista", value=f"{moic_inv:.2f}x", subtitle="Múltiplo de capital retornado", color="#9C27B0"), unsafe_allow_html=True)
+        with col_k7:
+            st.markdown(card_autofin_tpl.format(title="VPN Inversionista", value=f"{npv_inv:.2f} MMUSD", subtitle=f"Valor Presente Neto (a {sel_sc['params'].get('discount_rate', 15.0):.1f}%)", color="#4CAF50"), unsafe_allow_html=True)
+
+        st.markdown("---")
+        # ─── CURVAS J COMPARATIVAS ───
+        st.subheader(f"📈 Curvas en J y Balance de Caja ({selected_case_lbl})")
+        st.markdown(
+            "La siguiente gráfica muestra el **Balance de Caja** acumulado en el fondo del proyecto "
+            "(recursos líquidos disponibles que inician en $C_0$) y el **Flujo de Caja Acumulado del Inversionista** "
+            "(entradas y salidas netas del socio inversor)."
+        )
+
+        pool_arr = np.array(case_data['cash_pool_autofin'])
+        inv_cum_arr = np.array(case_data['cum_cf_investor_post_tax'])
+        
+        if pool_arr.ndim == 2 and pool_arr.shape[0] > 1:
+            pool_p10, pool_p50, pool_p90 = np.percentile(pool_arr, [10, 50, 90], axis=0)
+            inv_p10, inv_p50, inv_p90 = np.percentile(inv_cum_arr, [10, 50, 90], axis=0)
+        else:
+            pool_p50 = pool_arr[0] if pool_arr.ndim == 2 else pool_arr
+            pool_p10 = pool_p50 * 0.9
+            pool_p90 = pool_p50 * 1.1
+            inv_p50 = inv_cum_arr[0] if inv_cum_arr.ndim == 2 else inv_cum_arr
+            inv_p10 = inv_p50 * 0.9
+            inv_p90 = inv_p50 * 1.1
+
+        start_d = pd.Timestamp(dates[0]) if dates else pd.Timestamp('2026-01-01')
+        m0_d = start_d - pd.DateOffset(months=1)
+        dates_with_m0 = [m0_d] + list(dates)
+
+        fig_j = go.Figure()
+        # Project Cash Pool (Y1)
+        fig_j.add_trace(go.Scatter(x=dates, y=pool_p50, name="Balance de Caja (P50)", line=dict(color="#d97706", width=3), legendgroup="pool"))
+        fig_j.add_trace(go.Scatter(x=dates, y=pool_p10, name="Balance P10", line=dict(color="#d97706", width=1), opacity=0.2, legendgroup="pool", showlegend=False))
+        fig_j.add_trace(go.Scatter(x=dates, y=pool_p90, name="Balance P90", line=dict(color="#d97706", width=1), fill='tonexty', fillcolor='rgba(217, 119, 6, 0.1)', opacity=0.2, legendgroup="pool", showlegend=False))
+
+        # Investor Cumulative Flow (Y2)
+        fig_j.add_trace(go.Scatter(x=dates_with_m0, y=inv_p50, name="Flujo Acumulado Inversionista (P50)", line=dict(color="#2196F3", width=3, dash='dash'), yaxis="y2", legendgroup="inv"))
+        fig_j.add_trace(go.Scatter(x=dates_with_m0, y=inv_p10, line=dict(color="#2196F3", width=1, dash='dash'), opacity=0.2, yaxis="y2", legendgroup="inv", showlegend=False))
+        fig_j.add_trace(go.Scatter(x=dates_with_m0, y=inv_p90, line=dict(color="#2196F3", width=1, dash='dash'), fill='tonexty', fillcolor='rgba(33, 150, 243, 0.08)', opacity=0.2, yaxis="y2", legendgroup="inv", showlegend=False))
+
+        fig_j.add_hline(y=0.0, line_dash="dot", line_color="rgba(0,0,0,0.3)", yref="y2")
+        fig_j.add_hline(y=cap_selected, line_dash="dashdot", line_color="rgba(217, 119, 6, 0.5)", yref="y", annotation_text=f"Capital Inicial: {cap_selected:.1f} MMUSD", annotation_position="top left")
+
+        fig_j.update_layout(
+            title=dict(text=f"Curva en J y Pool de Caja del Proyecto ({selected_case_lbl})", font=dict(family='Inter, sans-serif', size=16, color="#2d3748")),
+            xaxis=dict(title="Fecha", showgrid=True, gridcolor='rgba(0,0,0,0.05)'),
+            yaxis=dict(title="Balance del Fondo de Caja (MMUSD)", showgrid=True, gridcolor='rgba(0,0,0,0.05)'),
+            yaxis2=dict(title="Flujo Acumulado Inversionista (MMUSD)", overlaying="y", side="right", showgrid=False),
+            legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(t=50, b=90, l=50, r=50), height=460, hovermode="x unified"
+        )
+        st.plotly_chart(fig_j, use_container_width=True)
+
+        st.markdown("---")
+        # ─── COMPARATIVE TABLE ───
+        st.subheader("⚖️ Comparación de Escenarios: Modelo Estándar vs. Casos de Inversión")
+        st.markdown(
+            "La siguiente tabla compara las métricas clave de rentabilidad y exposición "
+            "bajo el modelo estándar del Contratista (sin capital inicial retenido) y los "
+            "tres casos evaluados de **Capital Inicial (MMUSD)**."
+        )
+
+        c1_d = autofin_cases['caso_1']
+        c2_d = autofin_cases['caso_2']
+        c3_d = autofin_cases['caso_3']
+
+        std_mco = ind_mean(sel_sc, 'max_financing_mm')
+        std_payout = ind_mean(sel_sc, 'payout_years') * 12.0
+        std_tirm_val = sel_sc['indicators'].get('irr_post_annual')
+        std_tirm_str = f"{float(std_tirm_val):.2f}%" if std_tirm_val is not None and np.isfinite(float(std_tirm_val)) else "N/A"
+        std_moic = ind_mean(sel_sc, 'moic')
+        std_npv = ind_mean(sel_sc, 'npv_hpoc_post')
+
+        c1_tirm = f"{c1_d['tirm_investor']:.2f}%" if c1_d['tirm_investor'] is not None and np.isfinite(c1_d['tirm_investor']) else "N/A"
+        c2_tirm = f"{c2_d['tirm_investor']:.2f}%" if c2_d['tirm_investor'] is not None and np.isfinite(c2_d['tirm_investor']) else "N/A"
+        c3_tirm = f"{c3_d['tirm_investor']:.2f}%" if c3_d['tirm_investor'] is not None and np.isfinite(c3_d['tirm_investor']) else "N/A"
+
+        c1_pay = f"Mes {int(round(np.mean(c1_d['payback_months_autofin'])))}" if np.mean(c1_d['payback_months_autofin']) < len(dates) else "N/A"
+        c2_pay = f"Mes {int(round(np.mean(c2_d['payback_months_autofin'])))}" if np.mean(c2_d['payback_months_autofin']) < len(dates) else "N/A"
+        c3_pay = f"Mes {int(round(np.mean(c3_d['payback_months_autofin'])))}" if np.mean(c3_d['payback_months_autofin']) < len(dates) else "N/A"
+        std_pay = f"Mes {int(round(std_payout))}" if std_payout < len(dates) else "N/A"
+
+        comp_matrix_rows = [
+            {
+                "Métrica": "Capital Inicial Aportado (C₀)",
+                "Modelo Estándar (Sin Buffer)": "0.0 MMUSD",
+                "Caso 1": f"{float(cap_cases[0]):.1f} MMUSD",
+                "Caso 2 (Base)": f"{float(cap_cases[1]):.1f} MMUSD",
+                "Caso 3": f"{float(cap_cases[2]):.1f} MMUSD",
+            },
+            {
+                "Métrica": "Máxima Exposición de Caja (MCO)",
+                "Modelo Estándar (Sin Buffer)": f"{std_mco:.2f} MMUSD",
+                "Caso 1": f"{np.mean(c1_d['mco_autofin']):.2f} MMUSD",
+                "Caso 2 (Base)": f"{np.mean(c2_d['mco_autofin']):.2f} MMUSD",
+                "Caso 3": f"{np.mean(c3_d['mco_autofin']):.2f} MMUSD",
+            },
+            {
+                "Métrica": "Mes de Mínima Caja",
+                "Modelo Estándar (Sin Buffer)": "Mes 1",
+                "Caso 1": f"Mes {int(round(np.mean(c1_d['min_pool_months']))) + 1}",
+                "Caso 2 (Base)": f"Mes {int(round(np.mean(c2_d['min_pool_months']))) + 1}",
+                "Caso 3": f"Mes {int(round(np.mean(c3_d['min_pool_months']))) + 1}",
+            },
+            {
+                "Métrica": "Mes de Autofinanciamiento / Retorno",
+                "Modelo Estándar (Sin Buffer)": std_pay,
+                "Caso 1": c1_pay,
+                "Caso 2 (Base)": c2_pay,
+                "Caso 3": c3_pay,
+            },
+            {
+                "Métrica": "Tasa Interna de Retorno (TIRM)",
+                "Modelo Estándar (Sin Buffer)": std_tirm_str,
+                "Caso 1": c1_tirm,
+                "Caso 2 (Base)": c2_tirm,
+                "Caso 3": c3_tirm,
+            },
+            {
+                "Métrica": "Múltiplo de Capital (MOIC)",
+                "Modelo Estándar (Sin Buffer)": f"{std_moic:.2f}x",
+                "Caso 1": f"{np.mean(c1_d['moic_investor']):.2f}x",
+                "Caso 2 (Base)": f"{np.mean(c2_d['moic_investor']):.2f}x",
+                "Caso 3": f"{np.mean(c3_d['moic_investor']):.2f}x",
+            },
+            {
+                "Métrica": "Valor Presente Neto (VPN MMUSD)",
+                "Modelo Estándar (Sin Buffer)": f"${std_npv:,.2f}M",
+                "Caso 1": f"${np.mean(c1_d['npv_investor']):,.2f}M",
+                "Caso 2 (Base)": f"${np.mean(c2_d['npv_investor']):,.2f}M",
+                "Caso 3": f"${np.mean(c3_d['npv_investor']):,.2f}M",
+            },
+        ]
+        st.dataframe(pd.DataFrame(comp_matrix_rows).set_index("Métrica"), use_container_width=True)
+
 
 
 
