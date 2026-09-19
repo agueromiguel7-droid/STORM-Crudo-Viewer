@@ -6,6 +6,7 @@ import plotly.express as px
 import json
 import glob
 import os
+import re
 import textwrap
 
 try:
@@ -1122,6 +1123,325 @@ with t_det3:
                 margin=dict(b=100, t=80)
             )
             st.plotly_chart(fig_act, use_container_width=True)
+
+        # ─── DISTRIBUCIÓN DE EGRESOS POR RENGLÓN (MEDIA MONTE CARLO) ────────
+        st.markdown("<hr style='margin: 30px 0 20px 0; border: none; border-top: 1px solid #e2e8f0;'>", unsafe_allow_html=True)
+        col_pie_title, col_pie_toggle = st.columns([1.8, 1])
+        with col_pie_title:
+            st.markdown(
+                "<div style='display:flex; align-items:center; gap:8px;'>"
+                "<span style='font-size:1.4rem;'>📊</span>"
+                "<h3 style='margin:0; color:#012743; font-family:Inter,sans-serif; font-weight:700; font-size:1.35rem;'>Distribución de Egresos por Renglón (Media Monte Carlo)</h3>"
+                "</div>",
+                unsafe_allow_html=True
+            )
+        with col_pie_toggle:
+            pie_mode = st.segmented_control(
+                "Visualización de Pastel Egresos",
+                options=["Porcentajes (%)", "Monto (MMUSD)"],
+                default="Porcentajes (%)",
+                label_visibility="collapsed",
+                key=f"pie_mode_egresos_{sel_esc_name}"
+            ) or "Porcentajes (%)"
+
+        egresos_det = sel_sc.get('egresos_detallados')
+
+        def get_subcategory_sum_from_json(egresos, cat, pattern):
+            if not egresos or cat not in egresos:
+                return 0.0
+            pattern_re = re.compile(pattern, re.IGNORECASE)
+            total = 0.0
+            for row_idx, vals in egresos[cat].items():
+                if pattern_re.search(str(row_idx)):
+                    total += sum(float(v) for v in vals)
+            return total
+
+        capex_infra = get_subcategory_sum_from_json(egresos_det, 'capex', r'Infra.*Media')
+        capex_pozo  = get_subcategory_sum_from_json(egresos_det, 'capex', r'Pozo.*Desarrollo.*Media')
+        capex_rma   = get_subcategory_sum_from_json(egresos_det, 'capex', r'RMA.*Media')
+        capex_expl  = get_subcategory_sum_from_json(egresos_det, 'capex', r'Explora.*Media')
+
+        opex_fijo   = get_subcategory_sum_from_json(egresos_det, 'opex', r'Fijo.*Media')
+        opex_rme    = get_subcategory_sum_from_json(egresos_det, 'opex', r'RME.*Media')
+        opex_var    = get_subcategory_sum_from_json(egresos_det, 'opex', r'Variable.*Media')
+        opex_mano   = get_subcategory_sum_from_json(egresos_det, 'opex', r'Mano.*Obra.*Media')
+        opex_adm    = get_subcategory_sum_from_json(egresos_det, 'opex', r'Administra.*Media')
+        opex_otro   = get_subcategory_sum_from_json(egresos_det, 'opex', r'Otros.*Egresos.*Media')
+
+        abex_infra  = get_subcategory_sum_from_json(egresos_det, 'abex', r'Abandono.*Infra.*Media')
+        abex_pozos  = get_subcategory_sum_from_json(egresos_det, 'abex', r'Abandono.*Pozos.*Media')
+
+        def render_pie_chart(labels, values, title, color_sequence):
+            filtered_labels = []
+            filtered_values = []
+            for l, v in zip(labels, values):
+                if v > 1e-4:
+                    filtered_labels.append(l)
+                    filtered_values.append(v)
+            
+            if not filtered_values:
+                st.markdown(f"""
+                <div style="background-color: #f8fafc; border-left: 4px solid #cbd5e1; padding: 20px; border-radius: 12px; height: 260px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.02); margin-top: 10px;">
+                    <div style="font-size: 2rem; margin-bottom: 5px;">🚫</div>
+                    <h6 style="color: #64748b; margin: 0; font-family: 'Inter', sans-serif; font-weight: 700;">{title}</h6>
+                    <p style="color: #94a3b8; font-size: 0.8rem; margin-top: 6px;">No aplica para este proyecto / Datos no disponibles</p>
+                </div>
+                """, unsafe_allow_html=True)
+                return
+
+            if pie_mode == "Porcentajes (%)":
+                text_info = 'percent+label'
+                text_list = None
+            else:
+                text_info = 'text+label'
+                text_list = [f"{v:.2f} MMUSD" for v in filtered_values]
+
+            fig = go.Figure(data=[go.Pie(
+                labels=filtered_labels,
+                values=filtered_values,
+                hole=0.45,
+                marker=dict(colors=color_sequence),
+                text=text_list,
+                textinfo=text_info,
+                insidetextorientation='horizontal',
+                hovertemplate="<b>%{label}</b><br>Monto: %{value:.2f} MMUSD<br>Porcentaje: %{percent}<extra></extra>"
+            )])
+            fig.update_layout(
+                title=dict(
+                    text=f"<b>{title}</b>",
+                    font=dict(family='Inter, sans-serif', size=15, color='#1a1c1e'),
+                    x=0.5,
+                    xanchor='center'
+                ),
+                showlegend=False,
+                margin=dict(t=50, b=10, l=10, r=10),
+                height=280,
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        c_pie1, c_pie2, c_pie3 = st.columns(3)
+        with c_pie1:
+            render_pie_chart(
+                ["Infraestructura", "Perforación", "RMA", "Exploración"],
+                [capex_infra, capex_pozo, capex_rma, capex_expl],
+                "CAPEX",
+                ['#1f77b4', '#3ca0e6', '#74b9ff', '#adcde7']
+            )
+        with c_pie2:
+            render_pie_chart(
+                ["Fijo", "RME", "Variable", "Mano de Obra", "Administración", "Otros Egresos"],
+                [opex_fijo, opex_rme, opex_var, opex_mano, opex_adm, opex_otro],
+                "OPEX",
+                ['#ff7f0e', '#ffa854', '#ffd1a4', '#d62728', '#f88379', '#fab1a0']
+            )
+        with c_pie3:
+            render_pie_chart(
+                ["Infraestructura", "Pozos"],
+                [abex_infra, abex_pozos],
+                "ABEX",
+                ['#2ca02c', '#55efc4']
+            )
+
+        # ─── ANÁLISIS DETALLADO DE INTERVENCIONES (DRILEX) ───────────────
+        df_drilex_list = sel_sc.get('params', {}).get('df_drilex', [])
+        if df_drilex_list:
+            st.markdown("<hr style='margin: 30px 0 20px 0; border: none; border-top: 1px solid #e2e8f0;'>", unsafe_allow_html=True)
+            st.markdown(
+                "<div style='display:flex; align-items:center; gap:8px; margin-bottom:15px;'>"
+                "<span style='font-size:1.4rem;'>🛢️</span>"
+                "<h3 style='margin:0; color:#012743; font-family:Inter,sans-serif; font-weight:700; font-size:1.35rem;'>Análisis Detallado de Intervenciones (DRILEX)</h3>"
+                "</div>",
+                unsafe_allow_html=True
+            )
+            
+            df_drilex_df = pd.DataFrame(df_drilex_list)
+            if not df_drilex_df.empty and 'Fecha' in df_drilex_df.columns:
+                df_drilex_df['Fecha_dt'] = pd.to_datetime(df_drilex_df['Fecha'], dayfirst=True, errors='coerce')
+                
+                sc_dates_dt = pd.to_datetime(dates)
+                if len(sc_dates_dt) > 0:
+                    start_dt = sc_dates_dt[0]
+                    end_dt = sc_dates_dt[-1]
+                    df_filtered = df_drilex_df[(df_drilex_df['Fecha_dt'] >= start_dt) & (df_drilex_df['Fecha_dt'] <= end_dt)].copy()
+                    
+                    if not df_filtered.empty:
+                        # 1. Occurrence bar chart
+                        df_filtered['Mes'] = df_filtered['Fecha_dt'].dt.strftime('%Y-%m')
+                        if 'Cantidad de Pozos' in df_filtered.columns:
+                            df_filtered['Cantidad de Pozos'] = pd.to_numeric(df_filtered['Cantidad de Pozos'], errors='coerce').fillna(1)
+                            df_occ_raw = df_filtered.groupby(['Mes', 'Tipo de Actividad'])['Cantidad de Pozos'].sum().reset_index(name='Ocurrencias')
+                        else:
+                            df_occ_raw = df_filtered.groupby(['Mes', 'Tipo de Actividad']).size().reset_index(name='Ocurrencias')
+                        
+                        min_act_dt = df_filtered['Fecha_dt'].min()
+                        max_act_dt = df_filtered['Fecha_dt'].max()
+                        start_year = min_act_dt.year
+                        end_year = max_act_dt.year
+                        all_months = pd.date_range(start=f"{start_year}-01-01", end=f"{end_year}-12-01", freq='MS')
+                        
+                        all_types = ['Perforación', 'RMA', 'RME']
+                        months_str = all_months.strftime('%Y-%m')
+                        mux = pd.MultiIndex.from_product([months_str, all_types], names=['Mes', 'Tipo de Actividad'])
+                        df_template = pd.DataFrame(index=mux).reset_index()
+                        
+                        df_occ = pd.merge(df_template, df_occ_raw, on=['Mes', 'Tipo de Actividad'], how='left').fillna(0)
+                        df_occ['Ocurrencias'] = pd.to_numeric(df_occ['Ocurrencias'], errors='coerce').fillna(0).astype(int)
+                        df_occ = df_occ.sort_values('Mes')
+                        df_occ['Fecha_Grafica'] = pd.to_datetime(df_occ['Mes'] + '-01')
+                        
+                        fig_occ = px.bar(
+                            df_occ,
+                            x='Fecha_Grafica',
+                            y='Ocurrencias',
+                            color='Tipo de Actividad',
+                            barmode='stack',
+                            color_discrete_map={
+                                'Perforación': '#3ca0e6',
+                                'RMA': '#74b9ff',
+                                'RME': '#ffa854'
+                            },
+                            category_orders={'Tipo de Actividad': ['Perforación', 'RMA', 'RME']}
+                        )
+                        fig_occ.update_layout(
+                            title=dict(
+                                text="<b>Ocurrencia Mensual de Intervenciones</b>",
+                                font=dict(family='Inter, sans-serif', size=16, color='#1a1c1e'),
+                                x=0.5,
+                                xanchor='center'
+                            ),
+                            xaxis_title="Mes (Año-Mes)",
+                            yaxis_title="Cantidad de Intervenciones",
+                            legend_title="Actividad",
+                            font=dict(family='Inter, sans-serif', size=12),
+                            height=380,
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            hovermode='x unified',
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        fig_occ.update_xaxes(type='date', tickformat='%Y-%m', hoverformat='%Y-%m')
+                        
+                        # 2. Cost calculations from JSON
+                        discount_rate_drilex = float(sel_sc.get('params', {}).get('discount_rate', 15.0))
+                        
+                        def get_subcategory_metrics_from_json(egresos, cat, pattern, dates_list, discount_rate_ann):
+                            if not egresos or cat not in egresos:
+                                return 0.0, 0.0
+                            pattern_re = re.compile(pattern, re.IGNORECASE)
+                            monthly_flow = None
+                            for row_idx, vals in egresos[cat].items():
+                                if pattern_re.search(str(row_idx)):
+                                    arr_vals = np.array([float(v) for v in vals])
+                                    if monthly_flow is None:
+                                        monthly_flow = arr_vals
+                                    else:
+                                        monthly_flow += arr_vals
+                            
+                            if monthly_flow is None:
+                                return 0.0, 0.0
+                            nominal_sum = float(np.sum(monthly_flow))
+                            
+                            dr = discount_rate_ann / 100.0
+                            monthly_r = (1 + dr) ** (1 / 12) - 1
+                            months = np.arange(len(dates_list))
+                            discount_factors = (1 + monthly_r) ** months
+                            
+                            if len(monthly_flow) > len(discount_factors):
+                                monthly_flow = monthly_flow[:len(discount_factors)]
+                            elif len(monthly_flow) < len(discount_factors):
+                                discount_factors = discount_factors[:len(monthly_flow)]
+                                
+                            vp_sum = float(np.sum(monthly_flow / discount_factors))
+                            return nominal_sum, vp_sum
+                        
+                        nom_perf, vp_perf = get_subcategory_metrics_from_json(egresos_det, 'capex', r'Pozo.*Desarrollo.*Media', dates, discount_rate_drilex)
+                        nom_rma, vp_rma   = get_subcategory_metrics_from_json(egresos_det, 'capex', r'RMA.*Media', dates, discount_rate_drilex)
+                        nom_rme, vp_rme   = get_subcategory_metrics_from_json(egresos_det, 'opex', r'RME.*Media', dates, discount_rate_drilex)
+                        
+                        # Layout side by side
+                        col_dr1, col_dr2 = st.columns([1.5, 1])
+                        with col_dr1:
+                            st.plotly_chart(fig_occ, use_container_width=True)
+                        with col_dr2:
+                            drilex_cost_mode = st.segmented_control(
+                                "Tipo de Costo DRILEX",
+                                options=["Nominal", "Valor Presente (VP)"],
+                                default="Valor Presente (VP)",
+                                key=f"drilex_cost_mode_{sel_esc_name}"
+                            ) or "Valor Presente (VP)"
+                            
+                            labels_drilex = ["Perforación", "RMA", "RME"]
+                            if drilex_cost_mode == "Valor Presente (VP)":
+                                values_drilex = [vp_perf, vp_rma, vp_rme]
+                                unit = "MMUSD (VP)"
+                            else:
+                                values_drilex = [nom_perf, nom_rma, nom_rme]
+                                unit = "MMUSD"
+                            
+                            total_drilex = sum(values_drilex)
+                            colors_drilex = ['#3ca0e6', '#74b9ff', '#ffa854']
+                            
+                            filtered_labels = []
+                            filtered_values = []
+                            for l, v in zip(labels_drilex, values_drilex):
+                                if v > 1e-4:
+                                    filtered_labels.append(l)
+                                    filtered_values.append(v)
+                                    
+                            if filtered_values:
+                                _total_c = sum(filtered_values)
+                                _slice_text_c = [
+                                    f"<b>{l}</b><br>{v:.2f} {unit}" if v / _total_c >= 0.05 else ""
+                                    for l, v in zip(filtered_labels, filtered_values)
+                                ]
+                                _slice_pull_c = [0.07 if v / _total_c < 0.05 else 0 for v in filtered_values]
+
+                                fig_cost = go.Figure(data=[go.Pie(
+                                    labels=filtered_labels,
+                                    values=filtered_values,
+                                    hole=0.5,
+                                    marker=dict(colors=[colors_drilex[labels_drilex.index(l)] for l in filtered_labels]),
+                                    text=_slice_text_c,
+                                    textinfo='text',
+                                    textposition='inside',
+                                    insidetextorientation='horizontal',
+                                    pull=_slice_pull_c,
+                                    hovertemplate="<b>%{label}</b><br>Costo: %{value:.2f} " + unit + "<br>Porcentaje: %{percent:.1%}<extra></extra>"
+                                )])
+                                fig_cost.update_layout(
+                                    title=dict(
+                                        text=f"<b>Distribución de Costos DRILEX ({drilex_cost_mode})</b>",
+                                        font=dict(family='Inter, sans-serif', size=15, color='#1a1c1e'),
+                                        x=0.5, xanchor='center', y=0.98, yanchor='top'
+                                    ),
+                                    annotations=[dict(
+                                        text=f"Total<br><b>{total_drilex:.2f}</b><br>{unit}",
+                                        x=0.5, y=0.5, font_size=11, showarrow=False, align="center"
+                                    )],
+                                    showlegend=True,
+                                    legend=dict(
+                                        orientation="h", yanchor="bottom", y=-0.15,
+                                        xanchor="center", x=0.5,
+                                        font=dict(size=11), itemsizing='constant'
+                                    ),
+                                    margin=dict(t=50, b=70, l=20, r=20),
+                                    height=380,
+                                    paper_bgcolor='rgba(0,0,0,0)',
+                                    plot_bgcolor='rgba(0,0,0,0)',
+                                )
+                                st.plotly_chart(fig_cost, use_container_width=True)
+                            else:
+                                st.markdown(f"""
+                                <div style="background-color: #f8fafc; border-left: 4px solid #cbd5e1; padding: 20px; border-radius: 12px; height: 360px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.02); margin-top: 10px;">
+                                    <div style="font-size: 2.5rem; margin-bottom: 10px;">🚫</div>
+                                    <h5 style="color: #64748b; margin: 0; font-family: 'Inter', sans-serif; font-weight: 700;">Distribución de Costos DRILEX</h5>
+                                    <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 8px;">No hay costos asociados en este horizonte</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                    else:
+                        st.info("No hay intervenciones registradas en el horizonte de este escenario.")
 
 with t_det4:
     st.subheader("Net Present Value Distributions (MMUSD)")
