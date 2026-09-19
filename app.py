@@ -771,34 +771,90 @@ def get_p10_p50_p90(prod_dict, key):
     arr = np.array(raw) if len(raw) > 0 else np.zeros(1)
     return arr, arr, arr
 
+def reserves_bar(res_dict, title, color_1p, color_2p, color_3p, y_label):
+    order = ['1P', '2P', '3P']
+    labels = [k for k in order if k in res_dict]
+    values = [float(res_dict[k]) for k in labels]
+    colors = [color_1p, color_2p, color_3p]
+    fig = go.Figure()
+    for i, (lbl, val) in enumerate(zip(labels, values)):
+        fig.add_trace(go.Bar(
+            x=[lbl], y=[val], name=lbl,
+            marker_color=colors[i % len(colors)],
+            text=[f"{val:.1f}"], textposition='outside',
+            width=0.45
+        ))
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{title}</b>",
+            font=dict(family='Inter, sans-serif', size=17, color='#1a1c1e'),
+            x=0, y=0.98, xanchor='left'
+        ),
+        yaxis_title=y_label,
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(t=50, b=40, l=45, r=20),
+        yaxis=dict(showgrid=True, gridcolor='rgba(0,0,0,0.06)', rangemode='tozero'),
+        xaxis=dict(tickfont=dict(family='Inter, sans-serif', size=12)),
+        font=dict(family='Inter, sans-serif')
+    )
+    return fig
+
 def plot_dual(dates, rate_data, cum_data, res_dict, title, y1_lbl, y2_lbl, color):
     if isinstance(rate_data, tuple):
         r10, r50, r90 = rate_data
     else:
-        r10, r50, r90 = np.percentile(rate_data, [10, 50, 90], axis=0)
+        rate_arr = np.asarray(rate_data)
+        if rate_arr.ndim == 1:
+            r10 = r50 = r90 = rate_arr
+        else:
+            r10, r50, r90 = np.percentile(rate_arr, [10, 50, 90], axis=0)
         
     if isinstance(cum_data, tuple):
         c10, c50, c90 = cum_data
     else:
-        c10, c50, c90 = np.percentile(cum_data, [10, 50, 90], axis=0)
+        cum_arr = np.asarray(cum_data)
+        if cum_arr.ndim == 1:
+            c10 = c50 = c90 = cum_arr
+        else:
+            c10, c50, c90 = np.percentile(cum_arr, [10, 50, 90], axis=0)
         
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates, y=r10, name='Rate P10', line=dict(color=color, width=1), opacity=0.35))
-    fig.add_trace(go.Scatter(x=dates, y=r90, name='Rate P90', line=dict(color=color, width=1), fill='tonexty', fillcolor=f'rgba(0,128,0,0.15)' if 'green' in color else 'rgba(214,39,40,0.15)', opacity=0.35))
-    fig.add_trace(go.Scatter(x=dates, y=r50, name='Rate P50', line=dict(color=color, width=3)))
     
-    fig.add_trace(go.Scatter(x=dates, y=c10, name='Cum P10', yaxis='y2', line=dict(color=color, width=1, dash='dot'), opacity=0.5))
-    fig.add_trace(go.Scatter(x=dates, y=c50, name='Cum P50', yaxis='y2', line=dict(color=color, width=2, dash='dot')))
-    fig.add_trace(go.Scatter(x=dates, y=c90, name='Cum P90', yaxis='y2', line=dict(color=color, width=1, dash='dot'), opacity=0.5))
-    
-    dash_colors = ['#1a1a2e', '#4a4e69', '#9a8c98']
-    for i, (nm, val) in enumerate(res_dict.items()):
-        fig.add_trace(go.Scatter(x=dates, y=[val]*len(dates), name=f"Res {nm}", yaxis='y2', line=dict(color=dash_colors[i], width=1.5, dash='dashdot')))
-    fig.update_layout(title=dict(text=title, font=dict(size=20, color=color), y=0.98, x=0, xanchor='left'),
-        xaxis_title='Date', yaxis=dict(title=y1_lbl, showgrid=True, gridcolor='rgba(0,0,0,0.05)'),
-        yaxis2=dict(title=y2_lbl, overlaying='y', side='right', showgrid=False),
-        legend=dict(orientation='h', yanchor='top', y=-0.2, xanchor='center', x=0.5, font=dict(size=10)),
-        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', margin=dict(t=100, l=50, r=50, b=100), hovermode='x unified')
+    # 1. Reserves reference lines (3P, 2P, 1P)
+    dash_colors = {'1P': '#1a1a2e', '2P': '#4a4e69', '3P': '#7a7a8c'}
+    for nm in ['3P', '2P', '1P']:
+        if nm in res_dict:
+            val = float(res_dict[nm])
+            fig.add_trace(go.Scatter(
+                x=dates, y=[val]*len(dates), name=nm, yaxis='y2',
+                line=dict(color=dash_colors.get(nm, '#4a4e69'), width=1.5, dash='dashdot')
+            ))
+            
+    # 2. Cumulative curves
+    fig.add_trace(go.Scatter(x=dates, y=c90, name='Cum P90', yaxis='y2', line=dict(color=color, width=1, dash='dot'), opacity=0.6))
+    fig.add_trace(go.Scatter(x=dates, y=c50, name='Cum P50', yaxis='y2', line=dict(color=color, width=2.5, dash='dot')))
+    fig.add_trace(go.Scatter(x=dates, y=c10, name='Cum P10', yaxis='y2', line=dict(color=color, width=1, dash='dot'), opacity=0.6))
+
+    # 3. Production Rate curves & band
+    fig.add_trace(go.Scatter(x=dates, y=r50, name='Q P50', line=dict(color=color, width=2.5)))
+    fig.add_trace(go.Scatter(x=dates, y=r90, name='Q P90', line=dict(color=color, width=1), opacity=0.35))
+    fig.add_trace(go.Scatter(x=dates, y=r10, name='Q P10', line=dict(color=color, width=1),
+                             fill='tonexty', fillcolor='rgba(0,128,0,0.15)' if 'green' in color else 'rgba(214,39,40,0.15)', opacity=0.35))
+
+    layout_dict = dict(
+        xaxis_title='Fecha',
+        yaxis=dict(title=y1_lbl, showgrid=True, gridcolor='rgba(0,0,0,0.05)', rangemode='tozero'),
+        yaxis2=dict(title=y2_lbl, overlaying='y', side='right', showgrid=False, rangemode='tozero'),
+        legend=dict(orientation='h', yanchor='top', y=-0.2, xanchor='center', x=0.5, font=dict(family='Inter, sans-serif', size=10)),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(t=40 if not title else 80, l=50, r=50, b=100),
+        hovermode='x unified',
+        font=dict(family='Inter, sans-serif')
+    )
+    if title:
+        layout_dict['title'] = dict(text=f"<b>{title}</b>", font=dict(size=18, color=color), y=0.98, x=0, xanchor='left')
+    fig.update_layout(**layout_dict)
     return fig
 
 
@@ -920,6 +976,21 @@ with t_bubble:
     bubble_fig.update_layout(xaxis_title="Number of Interventions", yaxis_title=y_axis_opt, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(248,249,250,0.8)')
     st.plotly_chart(bubble_fig, use_container_width=True)
 
+    if len(scenarios) > 1:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.subheader("📊 Tabla Comparativa de Escenarios")
+        rows = []
+        for sc in scenarios:
+            rows.append({
+                "Escenario": sc['params'].get('esc_name', sc['_filename']),
+                "VPN Post-Tax (MMUSD)": round(ind_mean(sc, 'npv_hpoc_post'), 2),
+                "TIR / TIRM (%)": round(float(sc['indicators'].get('irr_post_annual', 0.0)), 2),
+                "MOIC (x)": round(ind_mean(sc, 'moic'), 2),
+                "Pico Inv. MCE (MMUSD)": round(ind_mean(sc, 'mce_mm'), 2),
+                "Gov. Take (%)": round(ind_mean(sc, 'npv_gov_take'), 2),
+            })
+        st.dataframe(pd.DataFrame(rows).set_index("Escenario"), use_container_width=True)
+
 with t_det1:
     st.subheader("Fiscal Waterfall per Barrel (USD/boe)")
     prod_sel = sel_sc.get('production', {})
@@ -960,18 +1031,30 @@ with t_det1:
     st.plotly_chart(wf_fig, use_container_width=True)
 
 with t_det2:
-    st.subheader("Production Forecasts")
+    st.subheader("Pronósticos de Producción")
     r1, r2 = st.columns(2)
     prod_sel = sel_sc.get('production', {})
+    res_oil = sel_sc.get('reserves_oil', {'1P': 0.0, '2P': 0.0, '3P': 0.0})
+    res_gas = sel_sc.get('reserves_gas', {'1P': 0.0, '2P': 0.0, '3P': 0.0})
+
     with r1:
         st.plotly_chart(plot_dual(
             dates, get_p10_p50_p90(prod_sel, 'Qo'), get_p10_p50_p90(prod_sel, 'NP'),
-            sel_sc.get('reserves_oil', {}), "Oil Production Forecast", "Rate (bpd)", "Cumulative (MMbbls)", "green"
+            res_oil, "", "Gasto (bpd)", "Np (MMbls)", "green"
         ), use_container_width=True)
+        st.plotly_chart(reserves_bar(
+            res_oil, "Reservas de Aceite (MMb)",
+            '#1a1a2e', '#1f77b4', '#74b9ff', "MMb"
+        ), use_container_width=True)
+
     with r2:
         st.plotly_chart(plot_dual(
             dates, get_p10_p50_p90(prod_sel, 'Qg'), get_p10_p50_p90(prod_sel, 'GP'),
-            sel_sc.get('reserves_gas', {}), "Gas Production Forecast", "Rate (Mcfd)", "Cumulative (Bcf)", "#d62728"
+            res_gas, "", "Gasto (Mpcd)", "Gp (MMMpc)", "#d62728"
+        ), use_container_width=True)
+        st.plotly_chart(reserves_bar(
+            res_gas, "Reservas de Gas (MMMpc)",
+            '#1a1a2e', '#d62728', '#ff7f7f', "MMMpc"
         ), use_container_width=True)
 
 with t_det3:
@@ -1980,19 +2063,5 @@ with t_autofin:
 
 
 
-# ─── SECTION 3: MULTI-SCENARIO TABLE ──────────────────────────────────────
-if len(scenarios) > 1:
-    st.markdown("---")
-    st.subheader("📊 Multi-Scenario Comparative Table")
-    rows = []
-    for sc in scenarios:
-        rows.append({
-            "Scenario": sc['params'].get('esc_name', sc['_filename']),
-            "NPV Post-Tax (MMUSD)": round(ind_mean(sc, 'npv_hpoc_post'), 2),
-            "IRR (%)": round(float(sc['indicators'].get('irr_post_annual', 0.0)), 2),
-            "MOIC (x)": round(ind_mean(sc, 'moic'), 2),
-            "Peak Inv. (MMUSD)": round(ind_mean(sc, 'mce_mm'), 2),
-            "Gov. Take (%)": round(ind_mean(sc, 'npv_gov_take'), 2),
-        })
-    st.dataframe(pd.DataFrame(rows).set_index("Scenario"), use_container_width=True)
+
 
